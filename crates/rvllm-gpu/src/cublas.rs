@@ -25,16 +25,11 @@ impl CublasHandle {
         &self.device
     }
 
-    /// SGEMM: C = alpha * A * B + beta * C
+    /// SGEMM: C[m,n] = A[m,k] @ B[n,k]^T
     ///
-    /// A: [m, k], B: [k, n], C: [m, n] in row-major layout.
-    ///
-    /// cuBLAS expects column-major, so we compute C^T = B^T * A^T which
-    /// yields the correct row-major result without explicit transposes.
-    ///
-    /// # Safety
-    /// Caller must ensure slices have the correct lengths:
-    /// a >= m*k, b >= k*n, c >= m*n.
+    /// A is activations in row-major [m, k].
+    /// B is weights in PyTorch layout row-major [n, k].
+    /// C is output row-major [m, n].
     pub fn sgemm(
         &self,
         m: usize,
@@ -46,10 +41,9 @@ impl CublasHandle {
         beta: f32,
         c: &mut CudaSlice<f32>,
     ) -> Result<()> {
-        // SAFETY: cuBLAS reads/writes device memory through valid CudaSlice handles.
-        // Row-major trick: C^T = B^T * A^T  =>  call gemm(N, N, n, m, k, B, A, C)
-        // but since the *data* is row-major and cuBLAS sees it as column-major-transposed,
-        // we pass Op_T for both and swap A/B.
+        // b row[n,k] = col[k,n], OP_T -> [n,k]. lda=k.
+        // a row[m,k] = col[k,m], OP_N -> [k,m]. ldb=k.
+        // C_col[n,m] = row C[m,n]. ldc=n.
         unsafe {
             self.blas
                 .gemm(
@@ -60,7 +54,7 @@ impl CublasHandle {
                         n: m as i32,
                         k: k as i32,
                         alpha,
-                        lda: n as i32,
+                        lda: k as i32,
                         ldb: k as i32,
                         beta,
                         ldc: n as i32,
@@ -92,11 +86,7 @@ impl CublasHandle {
         beta: half::f16,
         c: &mut CudaSlice<half::f16>,
     ) -> Result<()> {
-        // Row-major trick: C^T = B^T * A^T
-        // cuBLAS sees column-major, so we swap A<->B and adjust dims.
-        //
-        // For f16, cudarc's Gemm trait implementation handles the GemmEx
-        // dispatch automatically when T=f16.
+        // Same mapping as sgemm: C[m,n] = A[m,k] @ B[n,k]^T
         unsafe {
             self.blas
                 .gemm(
@@ -107,7 +97,7 @@ impl CublasHandle {
                         n: m as i32,
                         k: k as i32,
                         alpha,
-                        lda: n as i32,
+                        lda: k as i32,
                         ldb: k as i32,
                         beta,
                         ldc: n as i32,
@@ -178,5 +168,57 @@ impl CublasHandle {
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemv failed: {e}")))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests {
+    use super::*;
+    use cudarc::driver::CudaDevice;
+
+    #[test]
+    fn sgemm_a_times_bt() {
+        let dev = CudaDevice::new(0).unwrap();
+        let handle = CublasHandle::new(dev.clone()).unwrap();
+
+        // A[2,3] row-major (activations)
+        let a_host: Vec<f32> = vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+        ];
+        // B[4,3] row-major (weights in PyTorch [out, in] layout)
+        let b_host: Vec<f32> = vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+            10.0, 11.0, 12.0,
+        ];
+
+        let a_gpu = dev.htod_sync_copy(&a_host).unwrap();
+        let b_gpu = dev.htod_sync_copy(&b_host).unwrap();
+        let mut c_gpu = dev.alloc_zeros::<f32>(2 * 4).unwrap();
+
+        // sgemm(m=2, n=4, k=3): C[2,4] = A[2,3] @ B[4,3]^T
+        handle.sgemm(2, 4, 3, 1.0, &a_gpu, &b_gpu, 0.0, &mut c_gpu).unwrap();
+
+        let c_host = dev.dtoh_sync_copy(&c_gpu).unwrap();
+
+        // CPU reference: C[i,j] = sum_k A[i,k] * B[j,k]
+        let mut expected = vec![0.0f32; 8];
+        for i in 0..2 {
+            for j in 0..4 {
+                for kk in 0..3 {
+                    expected[i * 4 + j] += a_host[i * 3 + kk] * b_host[j * 3 + kk];
+                }
+            }
+        }
+
+        for (idx, (got, exp)) in c_host.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-4,
+                "mismatch at index {idx}: got {got}, expected {exp}"
+            );
+        }
     }
 }
