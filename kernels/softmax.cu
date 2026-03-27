@@ -1,10 +1,10 @@
-// Numerically stable softmax kernel using online (single-pass) algorithm.
-// Uses warp-level primitives for efficient reduction.
+// Numerically stable softmax kernel.
+// Uses shared memory tree reduction -- correct for any block size (1 to 1024).
 //
 // Launch config:
 //   Grid:  (num_rows, 1, 1)
 //   Block: (min(vocab_size, 1024), 1, 1)
-//   Shared memory: 2 * sizeof(float) (for global max and sum broadcast)
+//   Shared memory: none (uses static shared arrays)
 //
 // Each block computes softmax for one row.
 
@@ -19,88 +19,58 @@ __global__ void softmax_kernel(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
+    const int n = blockDim.x;
 
     const float* x = input + row * vocab_size;
     float* y = output + row * vocab_size;
 
-    // Pass 1: Find max using warp-level reduction
+    __shared__ float smem[1024];
+
+    // Pass 1: thread-local max across strided elements
     float local_max = -FLT_MAX;
     for (int i = tid; i < vocab_size; i += stride) {
         local_max = fmaxf(local_max, x[i]);
     }
-
-    // Warp reduction for max
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
-    }
-
-    // Cross-warp reduction via shared memory
-    __shared__ float s_max;
-    __shared__ float s_sum;
-
-    // First thread of each warp participates
-    if (tid % warpSize == 0) {
-        atomicMax((int*)&s_max, __float_as_int(local_max));
-    }
-    if (tid == 0) s_max = -FLT_MAX;
+    smem[tid] = local_max;
     __syncthreads();
 
-    // Re-do max properly: each warp-leader writes, then we reduce
-    // Simpler approach: use shared memory array for warp leaders
-    __shared__ float warp_max[32]; // up to 32 warps per block
-    int warp_id = tid / warpSize;
-    int lane_id = tid % warpSize;
-
-    if (lane_id == 0) {
-        warp_max[warp_id] = local_max;
-    }
-    __syncthreads();
-
-    // Thread 0 reduces across warps
-    if (tid == 0) {
-        float m = -FLT_MAX;
-        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-        for (int w = 0; w < num_warps; w++) {
-            m = fmaxf(m, warp_max[w]);
+    // Tree reduction for max (handles any blockDim including non-power-of-2)
+    for (int s = n / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < n) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + s]);
         }
-        s_max = m;
+        // Handle odd-sized reductions: fold last element into first
+        if (s * 2 < n && tid == 0) {
+            smem[0] = fmaxf(smem[0], smem[s * 2]);
+        }
+        __syncthreads();
     }
+    float row_max = smem[0];
     __syncthreads();
 
-    float row_max = s_max;
-
-    // Pass 2: Compute exp(x - max) and local sum
+    // Pass 2: compute exp(x - max) and thread-local sum
     float local_sum = 0.0f;
     for (int i = tid; i < vocab_size; i += stride) {
         float e = expf(x[i] - row_max);
-        y[i] = e; // store exp temporarily
+        y[i] = e;
         local_sum += e;
     }
-
-    // Warp reduction for sum
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    }
-
-    __shared__ float warp_sum[32];
-    if (lane_id == 0) {
-        warp_sum[warp_id] = local_sum;
-    }
+    smem[tid] = local_sum;
     __syncthreads();
 
-    if (tid == 0) {
-        float s = 0.0f;
-        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-        for (int w = 0; w < num_warps; w++) {
-            s += warp_sum[w];
+    // Tree reduction for sum
+    for (int s = n / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < n) {
+            smem[tid] += smem[tid + s];
         }
-        s_sum = s;
+        if (s * 2 < n && tid == 0) {
+            smem[0] += smem[s * 2];
+        }
+        __syncthreads();
     }
-    __syncthreads();
+    float inv_sum = 1.0f / smem[0];
 
-    float inv_sum = 1.0f / s_sum;
-
-    // Pass 3: Normalize
+    // Pass 3: normalize
     for (int i = tid; i < vocab_size; i += stride) {
         y[i] *= inv_sum;
     }
