@@ -20,10 +20,13 @@ mod inner {
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
-    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
+    use rvllm_sequence::{
+        Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus,
+    };
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::GpuWorker;
 
+    use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
 
     // ------------------------------------------------------------------
@@ -50,73 +53,7 @@ mod inner {
     }
 
     fn resolve_model_dir(model_name: &str) -> Result<PathBuf> {
-        let path = Path::new(model_name);
-        if path.is_dir() {
-            return Ok(path.to_path_buf());
-        }
-
-        // Look in HF cache
-        let cache_dir = dirs_hf_cache();
-        let repo_dir_name = format!("models--{}", model_name.replace('/', "--"));
-        let repo_path = cache_dir.join(&repo_dir_name).join("snapshots");
-
-        if repo_path.is_dir() {
-            // Find the first snapshot
-            if let Ok(entries) = std::fs::read_dir(&repo_path) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let snap_path = entry.path();
-                    if snap_path.is_dir() {
-                        // Check for config.json
-                        if snap_path.join("config.json").exists() {
-                            info!(path = %snap_path.display(), "found model in HF cache");
-                            return Ok(snap_path);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try downloading via hf-hub
-        info!(model = model_name, "downloading model from HuggingFace");
-        let api = hf_hub::api::sync::Api::new()
-            .map_err(|e| LLMError::ModelError(format!("failed to init hf-hub: {e}")))?;
-        let repo = api.model(model_name.to_string());
-
-        // Download config.json and model files
-        let _config_path = repo
-            .get("config.json")
-            .map_err(|e| LLMError::ModelError(format!("failed to download config.json: {e}")))?;
-        let _model_path = repo.get("model.safetensors").map_err(|e| {
-            LLMError::ModelError(format!("failed to download model.safetensors: {e}"))
-        })?;
-
-        // Re-check cache after download
-        if repo_path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&repo_path) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let snap_path = entry.path();
-                    if snap_path.is_dir() && snap_path.join("config.json").exists() {
-                        return Ok(snap_path);
-                    }
-                }
-            }
-        }
-
-        Err(LLMError::ModelError(format!(
-            "could not resolve model directory for '{}'",
-            model_name
-        )))
-    }
-
-    fn dirs_hf_cache() -> PathBuf {
-        if let Ok(cache) = std::env::var("HF_HOME") {
-            return PathBuf::from(cache).join("hub");
-        }
-        if let Ok(cache) = std::env::var("HUGGINGFACE_HUB_CACHE") {
-            return PathBuf::from(cache);
-        }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        PathBuf::from(home).join(".cache/huggingface/hub")
+        hf_snapshot::ensure_snapshot(model_name)
     }
 
     fn read_model_config(model_dir: &Path) -> Result<HfModelConfig> {
@@ -764,7 +701,11 @@ mod inner {
                     .collect();
                 for sid in dead_sids {
                     if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                        debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
+                        debug!(
+                            seq_id = sid.0,
+                            num_blocks = blocks.len(),
+                            "recycling blocks from finished sequence"
+                        );
                         for b in blocks {
                             self.free_blocks.push(b.0);
                         }
@@ -812,7 +753,10 @@ mod inner {
         fn build_metadata(
             &mut self,
             groups: &[SequenceGroup],
-        ) -> (Vec<SequenceGroupMetadata>, std::collections::HashSet<SequenceId>) {
+        ) -> (
+            Vec<SequenceGroupMetadata>,
+            std::collections::HashSet<SequenceId>,
+        ) {
             let block_size = self.config.cache.block_size;
             let mut metadata = Vec::with_capacity(groups.len());
             let mut aborted_seqs: std::collections::HashSet<SequenceId> =
@@ -865,7 +809,8 @@ mod inner {
                             }
                         }
                         // Mark finished so the scheduler drops it next round.
-                        self.scheduler.finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                        self.scheduler
+                            .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
                         aborted_seqs.insert(seq.seq_id);
                         continue;
                     }
