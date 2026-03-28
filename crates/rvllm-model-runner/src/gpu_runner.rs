@@ -24,7 +24,9 @@ mod cuda_impl {
     use std::cell::RefCell;
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+    use std::cell::Cell;
+
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -85,6 +87,23 @@ mod cuda_impl {
         }
     }
 
+    /// Element offsets into the packed metadata GPU buffer.
+    #[derive(Clone, Copy, Default)]
+    struct PackedMetaOffsets {
+        token_ids: usize,
+        positions: usize,
+        context_lens: usize,
+        block_tables: usize,
+        slot_mapping: usize,
+        seq_start_pos: usize,
+        num_token_ids: usize,
+        num_positions: usize,
+        num_context_lens: usize,
+        num_block_tables: usize,
+        num_slot_mapping: usize,
+        num_seq_start_pos: usize,
+    }
+
     pub struct GpuModelRunner {
         weights: GpuModelWeights,
         cache: CudaCacheEngine,
@@ -104,30 +123,17 @@ mod cuda_impl {
         rope_sin: CudaSlice<f32>,
         /// When true, use hgemm with f16 projection weights instead of sgemm.
         use_fp16: bool,
-        /// Pre-allocated GPU buffers for per-step metadata, reused across
-        /// forward calls to avoid CUDA malloc/free on the decode hot path.
-        /// Interior mutability via RefCell since forward_ex takes &self.
-        meta_positions: RefCell<ReusableGpuBuf>,
-        meta_context_lens: RefCell<ReusableGpuBuf>,
-        meta_block_tables: RefCell<ReusableGpuBuf>,
-        meta_slot_mapping: RefCell<ReusableGpuBuf>,
-        meta_seq_start_pos: RefCell<ReusableGpuBuf>,
-        /// Pre-allocated GPU buffer for token IDs (embedding lookup input).
-        /// Using a persistent buffer ensures the GPU pointer is stable across
-        /// forward calls, which is required for CUDA graph capture/replay.
-        meta_token_ids: RefCell<ReusableGpuBuf>,
+        /// Single packed GPU buffer for all per-step metadata (token_ids,
+        /// positions, context_lens, block_tables, slot_mapping, seq_start_pos).
+        /// One memcpy_htod per decode step instead of 6 separate transfers.
+        meta_packed: RefCell<ReusableGpuBuf>,
+        /// Element offsets into meta_packed for each metadata field.
+        meta_packed_offsets: Cell<PackedMetaOffsets>,
         /// Persistent GPU output buffer for CUDA graph capture/replay.
-        /// Stores the argmax token IDs from the last forward pass. The graph
-        /// writes to this buffer's stable pointer; after replay we DtoH copy
-        /// from here to read updated results.
         graph_output: RefCell<Option<CudaSlice<i32>>>,
-        /// Reusable CPU scratch buffer for packing metadata (avoids per-step
-        /// heap allocations for the common small-batch decode case).
+        /// Reusable CPU scratch buffer for packing metadata.
         cpu_scratch: RefCell<Vec<i32>>,
         /// Fixed max blocks per sequence for CUDA graph capture/replay.
-        /// Computed as ceil(max_position / block_size) so the block_tables
-        /// stride is constant across all forward calls, preventing stale
-        /// scalar kernel args when a graph is replayed.
         graph_max_blocks: usize,
     }
 
@@ -227,12 +233,8 @@ mod cuda_impl {
                 rope_cos,
                 rope_sin,
                 use_fp16: false,
-                meta_positions: RefCell::new(ReusableGpuBuf::new()),
-                meta_context_lens: RefCell::new(ReusableGpuBuf::new()),
-                meta_block_tables: RefCell::new(ReusableGpuBuf::new()),
-                meta_slot_mapping: RefCell::new(ReusableGpuBuf::new()),
-                meta_seq_start_pos: RefCell::new(ReusableGpuBuf::new()),
-                meta_token_ids: RefCell::new(ReusableGpuBuf::new()),
+                meta_packed: RefCell::new(ReusableGpuBuf::new()),
+                meta_packed_offsets: Cell::new(PackedMetaOffsets::default()),
                 graph_output: RefCell::new(None),
                 cpu_scratch: RefCell::new(Vec::with_capacity(4096)),
                 graph_max_blocks,
@@ -275,72 +277,21 @@ mod cuda_impl {
 
             debug!(num_tokens, num_seqs, is_prefill, greedy_only, "GpuModelRunner::forward_ex");
 
-            // Upload per-step metadata into reusable GPU buffers.
-            // On the decode hot path, buffer sizes are stable so this is pure
-            // memcpy_htod with zero CUDA malloc/free. The CPU scratch vec is
-            // also reused to avoid per-step heap allocations.
-            // Use fixed stride for block_tables so the layout matches what
-            // CUDA graph kernels expect (p_max_blocks is baked as a scalar).
-            let max_blocks = self.graph_max_blocks;
             let max_context_len = attn_meta.max_context_len;
 
-            {
-                let mut scratch = self.cpu_scratch.borrow_mut();
+            // Single packed upload: all 6 metadata fields in one memcpy_htod.
+            self.upload_metadata(token_ids, positions, attn_meta)?;
 
-                // positions (i32)
-                scratch.clear();
-                scratch.extend(positions.iter().map(|&p| p as i32));
-                self.meta_positions.borrow_mut().upload(&scratch, &self.stream)
-                    .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
-
-                // context_lens (i32)
-                scratch.clear();
-                scratch.extend(attn_meta.context_lens.iter().map(|&c| c as i32));
-                self.meta_context_lens.borrow_mut().upload(&scratch, &self.stream)
-                    .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
-
-                // block_tables flattened [num_seqs, graph_max_blocks] (i32)
-                scratch.clear();
-                scratch.resize(num_seqs * max_blocks, 0i32);
-                for (s, row) in attn_meta.block_tables.iter().enumerate() {
-                    for (b, &blk) in row.iter().enumerate() {
-                        scratch[s * max_blocks + b] = blk as i32;
-                    }
-                }
-                self.meta_block_tables.borrow_mut().upload(&scratch, &self.stream)
-                    .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
-
-                // slot_mapping (i32)
-                scratch.clear();
-                scratch.extend(attn_meta.slot_mapping.iter().map(|&s| s as i32));
-                self.meta_slot_mapping.borrow_mut().upload(&scratch, &self.stream)
-                    .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
-
-                // seq_start_pos from query_lens [num_seqs + 1] (i32)
-                scratch.clear();
-                let mut pos = 0i32;
-                for &ql in &attn_meta.query_lens {
-                    scratch.push(pos);
-                    pos += ql as i32;
-                }
-                scratch.push(num_tokens as i32);
-                self.meta_seq_start_pos.borrow_mut().upload(&scratch, &self.stream)
-                    .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
-            }
-
-            let meta_pos = self.meta_positions.borrow();
-            let meta_cl = self.meta_context_lens.borrow();
-            let meta_bt = self.meta_block_tables.borrow();
-            let meta_sm = self.meta_slot_mapping.borrow();
-            let meta_ssp = self.meta_seq_start_pos.borrow();
-
-            // Step 1: token embedding lookup
+            // Step 1: token embedding lookup from packed buffer
             info!("gpu_runner: embedding lookup");
-            let mut hidden_states = self.embedding_lookup(token_ids)?;
+            let mut hidden_states = self.embedding_lookup_from_meta(num_tokens)?;
 
             // Step 2: transformer layers
             let gpu_cache = self.cache.gpu_cache();
             let num_layers = self.layers.len();
+            let meta_packed = self.meta_packed.borrow();
+            let packed_buf = meta_packed.slice();
+            let offsets = self.meta_packed_offsets.get();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if layer_idx == 0 || layer_idx == num_layers - 1 {
                     info!(layer = layer_idx, use_fp16 = self.use_fp16, "gpu_runner: layer start");
@@ -348,18 +299,18 @@ mod cuda_impl {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let input = GpuLayerInput {
                     hidden_states: &hidden_states,
-                    positions: meta_pos.slice(),
+                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: meta_bt.slice(),
-                    context_lens: meta_cl.slice(),
-                    slot_mapping: meta_sm.slice(),
+                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
+                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
+                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: meta_ssp.slice(),
+                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                 };
@@ -473,60 +424,65 @@ mod cuda_impl {
         ) -> Result<()> {
             let num_tokens = token_ids.len();
             let num_seqs = attn_meta.context_lens.len();
-            // Use the fixed max_blocks stride so that block_tables.len()/num_seqs
-            // is always the same value. This is critical for CUDA graph replay:
-            // the attention kernel receives p_max_blocks as a scalar arg baked
-            // into the graph, and the data layout must match that stride.
             let max_blocks = self.graph_max_blocks;
 
             let mut scratch = self.cpu_scratch.borrow_mut();
-
-            // token_ids (i32)
             scratch.clear();
+
+            // Pack all 6 metadata fields contiguously, recording offsets.
+            let token_ids_off = scratch.len();
             scratch.extend(token_ids.iter().map(|&t| t as i32));
-            self.meta_token_ids.borrow_mut().upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
+            let num_token_ids = scratch.len() - token_ids_off;
 
-            // positions (i32)
-            scratch.clear();
+            let positions_off = scratch.len();
             scratch.extend(positions.iter().map(|&p| p as i32));
-            self.meta_positions.borrow_mut().upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
+            let num_positions = scratch.len() - positions_off;
 
-            // context_lens (i32)
-            scratch.clear();
+            let context_lens_off = scratch.len();
             scratch.extend(attn_meta.context_lens.iter().map(|&c| c as i32));
-            self.meta_context_lens.borrow_mut().upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
+            let num_context_lens = scratch.len() - context_lens_off;
 
-            // block_tables flattened [num_seqs, graph_max_blocks] (i32)
-            // Always padded to fixed stride for CUDA graph pointer stability.
-            scratch.clear();
-            scratch.resize(num_seqs * max_blocks, 0i32);
+            // block_tables: [num_seqs, graph_max_blocks], zero-padded.
+            let block_tables_off = scratch.len();
+            let bt_len = num_seqs * max_blocks;
+            scratch.resize(scratch.len() + bt_len, 0i32);
             for (s, row) in attn_meta.block_tables.iter().enumerate() {
                 for (b, &blk) in row.iter().enumerate() {
-                    scratch[s * max_blocks + b] = blk as i32;
+                    scratch[block_tables_off + s * max_blocks + b] = blk as i32;
                 }
             }
-            self.meta_block_tables.borrow_mut().upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
 
-            // slot_mapping (i32)
-            scratch.clear();
+            let slot_mapping_off = scratch.len();
             scratch.extend(attn_meta.slot_mapping.iter().map(|&s| s as i32));
-            self.meta_slot_mapping.borrow_mut().upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
+            let num_slot_mapping = scratch.len() - slot_mapping_off;
 
-            // seq_start_pos from query_lens [num_seqs + 1] (i32)
-            scratch.clear();
+            let seq_start_pos_off = scratch.len();
             let mut pos = 0i32;
             for &ql in &attn_meta.query_lens {
                 scratch.push(pos);
                 pos += ql as i32;
             }
             scratch.push(num_tokens as i32);
-            self.meta_seq_start_pos.borrow_mut().upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
+            let num_seq_start_pos = scratch.len() - seq_start_pos_off;
+
+            // Single packed upload (1 memcpy_htod instead of 6).
+            self.meta_packed.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("packed metadata HtoD: {e}")))?;
+
+            self.meta_packed_offsets.set(PackedMetaOffsets {
+                token_ids: token_ids_off,
+                positions: positions_off,
+                context_lens: context_lens_off,
+                block_tables: block_tables_off,
+                slot_mapping: slot_mapping_off,
+                seq_start_pos: seq_start_pos_off,
+                num_token_ids,
+                num_positions,
+                num_context_lens,
+                num_block_tables: bt_len,
+                num_slot_mapping,
+                num_seq_start_pos,
+            });
 
             Ok(())
         }
@@ -553,18 +509,15 @@ mod cuda_impl {
                 return Err(LLMError::ModelError("empty input".into()));
             }
 
-            let meta_pos = self.meta_positions.borrow();
-            let meta_cl = self.meta_context_lens.borrow();
-            let meta_bt = self.meta_block_tables.borrow();
-            let meta_sm = self.meta_slot_mapping.borrow();
-            let meta_ssp = self.meta_seq_start_pos.borrow();
-
             // Step 1: token embedding lookup from persistent buffer
             let mut hidden_states = self.embedding_lookup_from_meta(num_tokens)?;
 
-            // Step 2: transformer layers
+            // Step 2: transformer layers (views from packed metadata buffer)
             let gpu_cache = self.cache.gpu_cache();
             let num_layers = self.layers.len();
+            let meta_packed = self.meta_packed.borrow();
+            let packed_buf = meta_packed.slice();
+            let offsets = self.meta_packed_offsets.get();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if layer_idx == 0 || layer_idx == num_layers - 1 {
                     trace!(layer = layer_idx, use_fp16 = self.use_fp16, "gpu_runner graph body: layer");
@@ -572,18 +525,18 @@ mod cuda_impl {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let input = GpuLayerInput {
                     hidden_states: &hidden_states,
-                    positions: meta_pos.slice(),
+                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: meta_bt.slice(),
-                    context_lens: meta_cl.slice(),
-                    slot_mapping: meta_sm.slice(),
+                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
+                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
+                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: meta_ssp.slice(),
+                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                 };
@@ -713,34 +666,31 @@ mod cuda_impl {
                 return Err(LLMError::ModelError("empty input".into()));
             }
 
-            let meta_pos = self.meta_positions.borrow();
-            let meta_cl = self.meta_context_lens.borrow();
-            let meta_bt = self.meta_block_tables.borrow();
-            let meta_sm = self.meta_slot_mapping.borrow();
-            let meta_ssp = self.meta_seq_start_pos.borrow();
-
             // Step 1: token embedding lookup from persistent buffer
             let mut hidden_states = self.embedding_lookup_from_meta(num_tokens)?;
 
-            // Step 2: transformer layers
+            // Step 2: transformer layers (views from packed metadata buffer)
             let gpu_cache = self.cache.gpu_cache();
             let num_layers = self.layers.len();
+            let meta_packed = self.meta_packed.borrow();
+            let packed_buf = meta_packed.slice();
+            let offsets = self.meta_packed_offsets.get();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let input = GpuLayerInput {
                     hidden_states: &hidden_states,
-                    positions: meta_pos.slice(),
+                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: meta_bt.slice(),
-                    context_lens: meta_cl.slice(),
-                    slot_mapping: meta_sm.slice(),
+                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
+                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
+                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: meta_ssp.slice(),
+                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                 };
@@ -1045,20 +995,8 @@ mod cuda_impl {
             })
         }
 
-        fn embedding_lookup(&self, token_ids: &[u32]) -> Result<CudaSlice<f32>> {
-            // Upload token IDs into persistent buffer (stable pointer for graph replay).
-            {
-                let mut scratch = self.cpu_scratch.borrow_mut();
-                scratch.clear();
-                scratch.extend(token_ids.iter().map(|&t| t as i32));
-                self.meta_token_ids.borrow_mut().upload(&scratch, &self.stream)
-                    .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
-            }
-            self.embedding_lookup_from_meta(token_ids.len())
-        }
-
-        /// Embedding lookup using the pre-uploaded token IDs in meta_token_ids.
-        /// Call upload_metadata() first to populate the buffer.
+        /// Embedding lookup using the pre-uploaded token IDs in the packed
+        /// metadata buffer. Call upload_metadata() first to populate.
         fn embedding_lookup_from_meta(&self, num_tokens: usize) -> Result<CudaSlice<f32>> {
             let hidden_size = self.config.hidden_size;
 
@@ -1071,7 +1009,12 @@ mod cuda_impl {
                 .alloc_zeros::<f32>(num_tokens * hidden_size)
                 .map_err(|e| LLMError::GpuError(format!("embed alloc: {e}")))?;
 
-            let meta_tid = self.meta_token_ids.borrow();
+            let meta_packed = self.meta_packed.borrow();
+            let packed_buf = meta_packed.slice();
+            let offsets = self.meta_packed_offsets.get();
+            let token_ids_view = packed_buf.slice(
+                offsets.token_ids..offsets.token_ids + offsets.num_token_ids,
+            );
 
             let block_dim = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -1085,7 +1028,7 @@ mod cuda_impl {
                     .launch_builder(&kernel)
                     .arg(&output)
                     .arg(&self.embed_tokens)
-                    .arg(meta_tid.slice())
+                    .arg(&token_ids_view)
                     .arg(&(hidden_size as i32))
                     .arg(&(self.config.vocab_size as i32))
                     .launch(cfg)

@@ -18,7 +18,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaSlice, CudaStream, CudaView, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{info, trace};
 
@@ -86,17 +86,17 @@ mod inner {
         /// Hidden states entering this layer, shape [num_tokens, hidden_size].
         pub hidden_states: &'a CudaSlice<f32>,
         /// Position ids for RoPE, shape [num_tokens]. Kernels expect int*.
-        pub positions: &'a CudaSlice<i32>,
+        pub positions: CudaView<'a, i32>,
         /// KV cache key block for this layer (f16), shape [num_blocks, block_size, num_kv_heads, head_dim].
         pub key_cache: &'a CudaSlice<f16>,
         /// KV cache value block for this layer (f16), shape [num_blocks, block_size, num_kv_heads, head_dim].
         pub value_cache: &'a CudaSlice<f16>,
         /// Block table mapping sequence positions to cache blocks, shape [num_seqs, max_blocks_per_seq].
-        pub block_tables: &'a CudaSlice<i32>,
+        pub block_tables: CudaView<'a, i32>,
         /// Context length for each sequence, shape [num_seqs].
-        pub context_lens: &'a CudaSlice<i32>,
+        pub context_lens: CudaView<'a, i32>,
         /// Slot mapping for cache writes during prefill, shape [num_tokens].
-        pub slot_mapping: &'a CudaSlice<i32>,
+        pub slot_mapping: CudaView<'a, i32>,
         /// Number of tokens in the batch.
         pub num_tokens: usize,
         /// Number of sequences in the batch.
@@ -109,7 +109,7 @@ mod inner {
         pub is_prefill: bool,
         /// Per-sequence query token start positions: [num_seqs + 1] with sentinel.
         /// Built from actual query token counts, NOT context_lens.
-        pub seq_start_pos: &'a CudaSlice<i32>,
+        pub seq_start_pos: CudaView<'a, i32>,
         /// RoPE cos table on GPU: [max_position, head_dim/2].
         pub rope_cos: &'a CudaSlice<f32>,
         /// RoPE sin table on GPU: [max_position, head_dim/2].
@@ -170,13 +170,13 @@ mod inner {
             let kv_dim = num_kv_heads * head_dim;
 
             let mut q = CudaLinearLayer::forward_mixed(
-                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas,
+                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas, &self.loader,
             )?;
             let mut k = CudaLinearLayer::forward_mixed(
-                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas,
+                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas, &self.loader,
             )?;
             let mut v = CudaLinearLayer::forward_mixed(
-                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas,
+                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas, &self.loader,
             )?;
 
             // QKV biases (f32)
@@ -196,7 +196,7 @@ mod inner {
                 &self.loader,
                 &mut q,
                 &mut k,
-                input.positions,
+                &input.positions,
                 input.rope_cos,
                 input.rope_sin,
                 num_tokens,
@@ -213,7 +213,7 @@ mod inner {
                 &v,
                 input.key_cache,
                 input.value_cache,
-                input.slot_mapping,
+                &input.slot_mapping,
                 num_tokens,
                 num_kv_heads,
                 head_dim,
@@ -226,9 +226,9 @@ mod inner {
                     &q,
                     input.key_cache,
                     input.value_cache,
-                    input.block_tables,
-                    input.context_lens,
-                    input.seq_start_pos,
+                    &input.block_tables,
+                    &input.context_lens,
+                    &input.seq_start_pos,
                     num_tokens,
                     input.num_seqs,
                     num_heads,
@@ -244,8 +244,8 @@ mod inner {
                     &q,
                     input.key_cache,
                     input.value_cache,
-                    input.block_tables,
-                    input.context_lens,
+                    &input.block_tables,
+                    &input.context_lens,
                     num_tokens,
                     input.num_seqs,
                     num_heads,
@@ -258,7 +258,7 @@ mod inner {
 
             // 5. Output projection (f16 weight)
             let attn_proj = CudaLinearLayer::forward_mixed(
-                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas,
+                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas, &self.loader,
             )?;
 
             // Fused residual + post-attention RMSNorm (1 kernel instead of 2)
@@ -272,14 +272,14 @@ mod inner {
 
             // 7. MLP (f16 weights)
             let gate = CudaLinearLayer::forward_mixed(
-                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas,
+                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas, &self.loader,
             )?;
             let up = CudaLinearLayer::forward_mixed(
-                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas,
+                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas, &self.loader,
             )?;
             let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
             let mlp_out = CudaLinearLayer::forward_mixed(
-                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas,
+                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas, &self.loader,
             )?;
 
             // 8. Residual
@@ -375,7 +375,7 @@ mod inner {
                 &self.loader,
                 &mut q,
                 &mut k,
-                input.positions,
+                &input.positions,
                 input.rope_cos,
                 input.rope_sin,
                 num_tokens,
@@ -396,7 +396,7 @@ mod inner {
                 &v,
                 input.key_cache,
                 input.value_cache,
-                input.slot_mapping,
+                &input.slot_mapping,
                 num_tokens,
                 num_kv_heads,
                 head_dim,
@@ -413,9 +413,9 @@ mod inner {
                     &q,
                     input.key_cache,
                     input.value_cache,
-                    input.block_tables,
-                    input.context_lens,
-                    input.seq_start_pos,
+                    &input.block_tables,
+                    &input.context_lens,
+                    &input.seq_start_pos,
                     num_tokens,
                     input.num_seqs,
                     num_heads,
@@ -433,8 +433,8 @@ mod inner {
                     &q,
                     input.key_cache,
                     input.value_cache,
-                    input.block_tables,
-                    input.context_lens,
+                    &input.block_tables,
+                    &input.context_lens,
                     num_tokens,
                     input.num_seqs,
                     num_heads,
@@ -624,7 +624,7 @@ mod inner {
             loader: &KernelLoader,
             q: &mut CudaSlice<f32>,
             k: &mut CudaSlice<f32>,
-            positions: &CudaSlice<i32>,
+            positions: &CudaView<'_, i32>,
             rope_cos: &CudaSlice<f32>,
             rope_sin: &CudaSlice<f32>,
             num_tokens: usize,
@@ -670,7 +670,7 @@ mod inner {
             loader: &KernelLoader,
             q: &CudaSlice<f32>,
             k: &CudaSlice<f32>,
-            positions: &CudaSlice<i32>,
+            positions: &CudaView<'_, i32>,
             rope_cos: &CudaSlice<f32>,
             rope_sin: &CudaSlice<f32>,
             num_tokens: usize,
@@ -747,7 +747,7 @@ mod inner {
             v: &CudaSlice<f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
-            slot_mapping: &CudaSlice<i32>,
+            slot_mapping: &CudaView<'_, i32>,
             num_tokens: usize,
             num_kv_heads: usize,
             head_dim: usize,
@@ -907,9 +907,9 @@ mod inner {
             q: &CudaSlice<f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
-            block_tables: &CudaSlice<i32>,
-            context_lens: &CudaSlice<i32>,
-            seq_start_pos: &CudaSlice<i32>,
+            block_tables: &CudaView<'_, i32>,
+            context_lens: &CudaView<'_, i32>,
+            seq_start_pos: &CudaView<'_, i32>,
             num_tokens: usize,
             num_seqs: usize,
             num_heads: usize,
@@ -1019,8 +1019,8 @@ mod inner {
             q: &CudaSlice<f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
-            block_tables: &CudaSlice<i32>,
-            context_lens: &CudaSlice<i32>,
+            block_tables: &CudaView<'_, i32>,
+            context_lens: &CudaView<'_, i32>,
             num_tokens: usize,
             num_seqs: usize,
             num_heads: usize,

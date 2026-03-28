@@ -128,23 +128,24 @@ impl CublasHandle {
         Ok(())
     }
 
-    /// Mixed-precision GEMM: C[m,n] = A[m,k] @ B[n,k]^T
+    /// HGEMM with f32 output: C[m,n] = A[m,k] @ B[n,k]^T
     ///
-    /// A is f32 activations in row-major [m, k].
+    /// A is f16 activations in row-major [m, k].
     /// B is f16 weights in PyTorch layout row-major [n, k].
     /// C is f32 output row-major [m, n].
     ///
-    /// Uses `cublasGemmEx` with per-operand types to avoid explicit cast
-    /// kernels (f16->f32 before SGEMM or f32->f16 before HGEMM).
-    /// Compute is done in f32 with tensor-op auto-selection.
+    /// Uses `cublasGemmEx` with A/B as f16 and C as f32. This eliminates
+    /// the output f16->f32 cast kernel (caller still casts input f32->f16,
+    /// but saves one cast + one alloc per linear vs the old hgemm path).
+    /// Compute in f32 with tensor-op auto-selection.
     #[cfg(feature = "cuda")]
-    pub fn gemm_ex_f32_f16(
+    pub fn hgemm_f32_output(
         &self,
         m: usize,
         n: usize,
         k: usize,
         alpha: f32,
-        a: &CudaSlice<f32>,
+        a: &CudaSlice<half::f16>,
         b: &CudaSlice<half::f16>,
         beta: f32,
         c: &mut CudaSlice<f32>,
@@ -157,10 +158,10 @@ impl CublasHandle {
             cudaDataType_t::{CUDA_R_16F, CUDA_R_32F},
         };
 
-        // Same row-major -> col-major mapping as sgemm:
-        // b row[n,k] = col[k,n], OP_T -> [n,k]. lda=k. (Atype = CUDA_R_16F)
-        // a row[m,k] = col[k,m], OP_N -> [k,m]. ldb=k. (Btype = CUDA_R_32F)
-        // C_col[n,m] = row C[m,n]. ldc=n. (Ctype = CUDA_R_32F)
+        // Same row-major -> col-major mapping as sgemm/hgemm:
+        // b row[n,k] = col[k,n], OP_T -> [n,k]. lda=k. (A = f16)
+        // a row[m,k] = col[k,m], OP_N -> [k,m]. ldb=k. (B = f16)
+        // C_col[n,m] = row C[m,n]. ldc=n. (C = f32)
         let (b_ptr, _b_guard) = DevicePtr::device_ptr(b, &self.stream);
         let (a_ptr, _a_guard) = DevicePtr::device_ptr(a, &self.stream);
         let (c_ptr, _c_guard) = DevicePtrMut::device_ptr_mut(c, &self.stream);
@@ -178,7 +179,7 @@ impl CublasHandle {
                 CUDA_R_16F,
                 k as i32,
                 a_ptr as *const std::ffi::c_void,
-                CUDA_R_32F,
+                CUDA_R_16F,
                 k as i32,
                 &beta as *const f32 as *const std::ffi::c_void,
                 c_ptr as *mut std::ffi::c_void,
@@ -189,7 +190,7 @@ impl CublasHandle {
             );
             if status != CUBLAS_STATUS_SUCCESS {
                 return Err(crate::LLMError::GpuError(
-                    format!("cublasGemmEx (f32xf16) failed: {status:?}")
+                    format!("cublasGemmEx (f16xf16->f32) failed: {status:?}")
                 ));
             }
         }
@@ -198,13 +199,13 @@ impl CublasHandle {
 
     /// No-op stub when cuda feature is off.
     #[cfg(not(feature = "cuda"))]
-    pub fn gemm_ex_f32_f16(
+    pub fn hgemm_f32_output(
         &self,
         _m: usize,
         _n: usize,
         _k: usize,
         _alpha: f32,
-        _a: &CudaSlice<f32>,
+        _a: &CudaSlice<half::f16>,
         _b: &CudaSlice<half::f16>,
         _beta: f32,
         _c: &mut CudaSlice<f32>,

@@ -170,8 +170,10 @@ impl CudaLinearLayer {
     }
 
     /// Mixed-precision forward: f32 input, f16 weight, f32 output.
-    /// Uses cublasGemmEx internally -- no cast kernels, no intermediate allocs.
-    /// Replaces forward_once_f16 which does 2 cast kernels + 2 extra allocs.
+    ///
+    /// Casts input f32->f16, then uses cublasGemmEx(f16,f16->f32) to produce
+    /// f32 output directly. Saves 1 cast kernel + 1 alloc per call vs the old
+    /// forward_once_f16 which does cast_in + hgemm + cast_out (2 casts + 2 allocs).
     pub fn forward_mixed(
         input: &CudaSlice<f32>,
         weight: &CudaSlice<f16>,
@@ -179,12 +181,22 @@ impl CudaLinearLayer {
         n: usize,
         k: usize,
         blas: &CublasHandle,
+        loader: &rvllm_gpu::kernel_loader::KernelLoader,
     ) -> Result<CudaSlice<f32>> {
         let stream = blas.stream();
+
+        // Cast input f32 -> f16 (still needed; cuBLAS requires matching A/B types)
+        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
+            .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
+        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
+
+        // Alloc f32 output directly (no f16 intermediate + cast)
         let mut output = stream
             .alloc_zeros::<f32>(m * n)
             .map_err(|e| LLMError::GpuError(format!("forward_mixed alloc: {e}")))?;
-        blas.gemm_ex_f32_f16(m, n, k, 1.0, input, weight, 0.0, &mut output)?;
+
+        // f16 x f16 -> f32 via cublasGemmEx
+        blas.hgemm_f32_output(m, n, k, 1.0, &input_f16, weight, 0.0, &mut output)?;
         Ok(output)
     }
 
