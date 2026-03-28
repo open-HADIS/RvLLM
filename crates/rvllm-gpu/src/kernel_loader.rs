@@ -8,6 +8,15 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchCo
 use cudarc::nvrtc::Ptx;
 use tracing::{debug, info, trace};
 
+/// Extract the raw CUfunction handle from a CudaFunction.
+/// CudaFunction's first field is `cu_function: sys::CUfunction` (a *mut CUfunc_st).
+/// SAFETY: CudaFunction is a non-repr(C) struct but the first field is always at offset 0 for
+/// a struct whose first field is a pointer (no padding before it). This is an implementation
+/// detail of cudarc 0.19 and is only used in unsafe raw-launch paths.
+unsafe fn extract_cu_function(func: &CudaFunction) -> cudarc::driver::sys::CUfunction {
+    std::ptr::read((func as *const CudaFunction).cast::<cudarc::driver::sys::CUfunction>())
+}
+
 use crate::Result;
 
 /// Known kernel -> function-name mappings for the vllm-rs kernel set.
@@ -219,12 +228,19 @@ impl KernelLoader {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<()> {
         let func = self.get_func(module, function)?;
-        // SAFETY: caller guarantees args match the kernel signature
-        let mut builder = self.stream.launch_builder(&func);
-        for arg in args.iter() {
-            builder = builder.arg(arg);
-        }
-        builder.launch(cfg).map_err(|e| {
+        self.context
+            .bind_to_thread()
+            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind failed: {e}")))?;
+        let cu_func = extract_cu_function(&func);
+        cudarc::driver::result::launch_kernel(
+            cu_func,
+            cfg.grid_dim,
+            cfg.block_dim,
+            cfg.shared_mem_bytes,
+            self.stream.cu_stream(),
+            args,
+        )
+        .map_err(|e| {
             crate::LLMError::GpuError(format!("kernel launch {module}::{function} failed: {e}"))
         })
     }
@@ -243,13 +259,19 @@ impl KernelLoader {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<()> {
         let func = self.get_func(module, function)?;
-        // SAFETY: caller guarantees args match the kernel signature and
-        // there are no data races on this stream
-        let mut builder = stream.launch_builder(&func);
-        for arg in args.iter() {
-            builder = builder.arg(arg);
-        }
-        builder.launch(cfg).map_err(|e| {
+        self.context
+            .bind_to_thread()
+            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind failed: {e}")))?;
+        let cu_func = extract_cu_function(&func);
+        cudarc::driver::result::launch_kernel(
+            cu_func,
+            cfg.grid_dim,
+            cfg.block_dim,
+            cfg.shared_mem_bytes,
+            stream.cu_stream(),
+            args,
+        )
+        .map_err(|e| {
             crate::LLMError::GpuError(format!(
                 "kernel launch {module}::{function} on stream failed: {e}"
             ))

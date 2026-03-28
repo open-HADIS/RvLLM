@@ -14,7 +14,7 @@ mod inner {
 
     use cudarc::driver::{
         CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
-        DeviceSlice as _, LaunchConfig,
+        LaunchConfig, PushKernelArg,
     };
     use tracing::trace;
 

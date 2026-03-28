@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchConfig,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use tracing::trace;
 
@@ -77,7 +77,7 @@ impl CudaSoftmax {
         input: &CudaSlice<f32>,
         num_rows: usize,
         vocab_size: usize,
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
     ) -> Result<CudaSlice<f32>> {
         let total = num_rows * vocab_size;
         if input.len() < total {
@@ -111,7 +111,7 @@ impl CudaSoftmax {
         data: &mut CudaSlice<f32>,
         num_rows: usize,
         vocab_size: usize,
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         let total = num_rows * vocab_size;
         if data.len() < total {
@@ -143,7 +143,7 @@ impl CudaSoftmax {
         input: &CudaSlice<f32>,
         num_rows: usize,
         vocab_size: usize,
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         let block_x = std::cmp::min(vocab_size as u32, MAX_BLOCK_SIZE);
         let cfg = LaunchConfig {

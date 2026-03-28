@@ -343,7 +343,7 @@ impl FlashAttention2 {
         max_context_len: usize,
         scale: f32,
     ) -> Result<GpuBuffer<f16>> {
-        use cudarc::driver::{CudaSlice, LaunchConfig};
+        use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
         let state = self
             .cuda_state

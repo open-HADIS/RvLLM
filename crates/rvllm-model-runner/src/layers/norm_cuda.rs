@@ -5,7 +5,9 @@
 //! cudarc for device memory types.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice as _, LaunchConfig};
+use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda")]
 use rvllm_core::error::{LLMError, Result};
 #[cfg(feature = "cuda")]
@@ -41,7 +43,7 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
     ) -> Result<CudaSlice<f32>> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -146,12 +148,15 @@ impl CudaRMSNorm {
         // SAFETY: In-place variant -- output pointer == input pointer. The kernel
         // uses __syncthreads() between reading input and writing output within each
         // block, so there is no data race for a single-token-per-block launch.
+        // We extract the raw device pointer first to avoid borrow conflicts from
+        // passing `input` as both &mut (output) and & (input) to the builder.
         let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
+        let (raw_ptr, _sync) = input.device_ptr_mut(stream);
         unsafe {
             stream
                 .launch_builder(&func)
-                .arg(input)   // output (aliases input)
-                .arg(input)   // input
+                .arg(&raw_ptr)       // output (same ptr)
+                .arg(&raw_ptr)       // input  (same ptr)
                 .arg(weight)
                 .arg(&eps)
                 .arg(&hidden_size_i32)

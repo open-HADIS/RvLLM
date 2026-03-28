@@ -23,7 +23,7 @@ pub enum ForwardOutput {
 mod cuda_impl {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig};
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -46,7 +46,7 @@ mod cuda_impl {
         weights: GpuModelWeights,
         cache: CudaCacheEngine,
         blas: CublasHandle,
-        loader: KernelLoader,
+        loader: Arc<KernelLoader>,
         config: ModelRunnerConfig,
         device: Arc<CudaContext>,
         stream: Arc<CudaStream>,
@@ -73,6 +73,7 @@ mod cuda_impl {
             device: Arc<CudaContext>,
             stream: Arc<CudaStream>,
         ) -> Result<Self> {
+            let loader = Arc::new(loader);
             debug!(
                 num_layers = config.num_layers,
                 hidden = config.hidden_size,
@@ -111,7 +112,7 @@ mod cuda_impl {
                     rms_norm_eps: 1e-5_f32,
                     layer_idx: i,
                 };
-                layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&stream)));
+                layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&stream), Arc::clone(&loader)));
             }
 
             // Precompute RoPE cos/sin tables
@@ -296,6 +297,7 @@ mod cuda_impl {
                 self.rms_norm_eps,
                 hidden_size,
                 &self.loader,
+                &self.stream,
             )?;
 
             // Step 4: LM head  normed [num_tokens, hidden] @ lm_head^T [hidden, vocab]
@@ -306,7 +308,7 @@ mod cuda_impl {
                     .or_else(|| self.weights.get_f16("model.embed_tokens.weight"));
                 if let Some(lm_w) = lm_f16 {
                     CudaLinearLayer::forward_once_f16(
-                        &normed, lm_w, num_tokens, vocab_size, hidden_size, &self.blas,
+                        &normed, lm_w, num_tokens, vocab_size, hidden_size, &self.blas, &self.loader,
                     )?
                 } else {
                     // Fallback: lm_head not available as f16, use f32

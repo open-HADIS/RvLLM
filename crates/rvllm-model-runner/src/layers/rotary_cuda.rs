@@ -11,7 +11,7 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig,
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
     };
     use tracing::debug;
 
@@ -181,7 +181,7 @@ mod inner {
             positions_host: &[i32],
             num_heads: usize,
             num_kv_heads: usize,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<()> {
             let positions_dev = stream
                 .clone_htod(positions_host)

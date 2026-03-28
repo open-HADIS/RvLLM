@@ -56,7 +56,8 @@ impl GpuAllocator for CudaGpuAllocator {
         Ok(GpuBuffer {
             inner: GpuBufferInner::Cuda {
                 slice,
-                device: Arc::clone(&self.context),
+                context: Arc::clone(&self.context),
+                stream: Arc::clone(&self.stream),
             },
         })
     }

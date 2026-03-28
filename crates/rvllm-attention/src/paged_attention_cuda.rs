@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaModule, CudaFunction, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaModule, CudaFunction, LaunchConfig, PushKernelArg};
 use half::f16;
 use tracing::{debug, trace};
 

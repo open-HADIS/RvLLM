@@ -18,7 +18,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice, LaunchConfig};
+    use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{info, trace};
 
@@ -170,13 +170,13 @@ mod inner {
             let kv_dim = num_kv_heads * head_dim;
 
             let mut q = CudaLinearLayer::forward_once_f16(
-                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas,
+                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas, &self.loader,
             )?;
             let mut k = CudaLinearLayer::forward_once_f16(
-                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas,
+                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas, &self.loader,
             )?;
             let mut v = CudaLinearLayer::forward_once_f16(
-                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas,
+                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas, &self.loader,
             )?;
 
             // QKV biases (f32)
@@ -258,7 +258,7 @@ mod inner {
 
             // 5. Output projection (f16 weight)
             let attn_proj = CudaLinearLayer::forward_once_f16(
-                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas,
+                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas, &self.loader,
             )?;
 
             // Residual
@@ -283,14 +283,14 @@ mod inner {
 
             // 7. MLP (f16 weights)
             let gate = CudaLinearLayer::forward_once_f16(
-                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas,
+                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas, &self.loader,
             )?;
             let up = CudaLinearLayer::forward_once_f16(
-                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas,
+                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas, &self.loader,
             )?;
             let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
             let mlp_out = CudaLinearLayer::forward_once_f16(
-                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas,
+                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas, &self.loader,
             )?;
 
             // 8. Residual

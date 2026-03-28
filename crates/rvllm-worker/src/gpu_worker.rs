@@ -612,6 +612,7 @@ impl GpuWorker {
             let ptx_dir = Self::find_ptx_dir();
             let loader = rvllm_gpu::kernel_loader::KernelLoader::new(
                 self.context.clone(),
+                self.stream.clone(),
                 &ptx_dir.unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
             )
             .map_err(|e| LLMError::GpuError(format!("kernel loader: {e}")))?;

@@ -8,7 +8,7 @@
 //! parent `mod.rs`. It delegates the unsafe cuBLAS call to `rvllm_gpu::cublas_ops`
 //! so this crate's `#![forbid(unsafe_code)]` is respected.
 
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchConfig};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use half::f16;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
@@ -136,13 +136,17 @@ impl CudaLinearLayer {
         n: usize,
         k: usize,
         blas: &CublasHandle,
-        cast_f32_f16: &CudaFunction,
-        cast_f16_f32: &CudaFunction,
+        loader: &rvllm_gpu::kernel_loader::KernelLoader,
     ) -> Result<CudaSlice<f32>> {
         let stream = blas.stream();
 
+        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
+            .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
+        let cast_f16_f32 = loader.get_func("cast_fp", "cast_f16_to_f32_kernel")
+            .map_err(|e| LLMError::GpuError(format!("load cast_f16_to_f32_kernel: {e}")))?;
+
         // Cast input f32 -> f16
-        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, cast_f32_f16)?;
+        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
 
         // Allocate f16 output
         let mut output_f16 = stream
@@ -160,7 +164,7 @@ impl CudaLinearLayer {
         )?;
 
         // Cast output f16 -> f32
-        Self::gpu_cast_f16_to_f32(stream, &output_f16, m * n, cast_f16_f32)
+        Self::gpu_cast_f16_to_f32(stream, &output_f16, m * n, &cast_f16_f32)
     }
 
     fn gpu_cast_f32_to_f16(

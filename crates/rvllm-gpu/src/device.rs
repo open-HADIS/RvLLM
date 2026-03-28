@@ -72,7 +72,7 @@ fn cuda_list_devices() -> Vec<GpuDevice> {
         devices.push(GpuDevice {
             id,
             name,
-            compute_capability: (major, minor),
+            compute_capability: (major as u32, minor as u32),
             total_memory,
         });
     }

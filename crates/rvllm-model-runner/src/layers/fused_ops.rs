@@ -13,7 +13,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig};
+    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use tracing::trace;
 
     use rvllm_core::prelude::{LLMError, Result};
