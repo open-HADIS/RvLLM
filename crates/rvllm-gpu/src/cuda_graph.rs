@@ -17,7 +17,8 @@ use crate::LLMError;
 use crate::Result;
 
 /// Supported batch sizes for which we pre-capture CUDA graphs.
-pub const GRAPH_BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32];
+/// Extended range covers high-concurrency decode (inspired by b12x/sglang).
+pub const GRAPH_BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
 
 /// Returns the smallest cached batch size >= `actual`, or `None` if `actual`
 /// exceeds the largest cached size.
@@ -224,12 +225,15 @@ mod tests {
         assert_eq!(padded_batch_size(5), Some(8));
         assert_eq!(padded_batch_size(9), Some(16));
         assert_eq!(padded_batch_size(17), Some(32));
+        assert_eq!(padded_batch_size(33), Some(64));
+        assert_eq!(padded_batch_size(65), Some(128));
+        assert_eq!(padded_batch_size(129), Some(256));
     }
 
     #[test]
     fn padded_batch_size_too_large() {
-        assert_eq!(padded_batch_size(33), None);
-        assert_eq!(padded_batch_size(64), None);
+        assert_eq!(padded_batch_size(257), None);
+        assert_eq!(padded_batch_size(512), None);
     }
 
     #[test]

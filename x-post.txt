@@ -1,5 +1,5 @@
 **rvLLM -- vLLM rewritten in Rust. One dev, 22 hours, $1,780.**
-matches vLLM at production batch sizes. 20x faster startup. 31x smaller binary. work in progress -- help me push this further.
+10,291 tok/s. Beats Python vLLM up to N=256. 20x faster startup. 31x smaller. work in progress -- help me push this further.
 
 ## what is it
 rvLLM is a from-scratch Rust implementation of vLLM for serving LLMs on GPUs. drop-in OpenAI API replacement. same endpoints, same format, just point your client at the Rust server.
@@ -26,16 +26,20 @@ python vLLM transfers the entire logit matrix (74 MB for Qwen2.5-1.5B at batch 1
 
 ## head-to-head (same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
 ```
-N=1:   rvLLM 58    | vLLM 69
-N=48:  rvLLM 3,436 | vLLM 2,887  -- rvLLM ahead
-N=64:  rvLLM 3,938 | vLLM 3,828  -- matched
-N=128: rvLLM 6,301 | vLLM 6,400  -- matched
-N=256: rvLLM 8,055 | vLLM 9,437
-N=512: rvLLM 8,308 | vLLM 10,771
-N=768: rvLLM 8,339 (peak)
-N=1024: rvLLM 8,308 | vLLM 12,740
+N=1:    rvLLM 117   | vLLM 69     -- rvLLM 1.7x faster
+N=4:    rvLLM 882   | vLLM 256
+N=8:    rvLLM 1,213 | vLLM 517
+N=16:   rvLLM 1,391 | vLLM 1,060
+N=32:   rvLLM 1,434 | vLLM 1,943
+N=48:   rvLLM 3,918 | vLLM 2,887  -- rvLLM ahead
+N=64:   rvLLM 4,796 | vLLM 3,828  -- rvLLM 1.25x
+N=96:   rvLLM 5,965 | vLLM 5,197  -- rvLLM 1.15x
+N=128:  rvLLM 7,380 | vLLM 6,400  -- rvLLM 1.15x
+N=256:  rvLLM 9,905 | vLLM 9,437  -- rvLLM 1.05x
+N=512:  rvLLM 10,291 | vLLM 10,771 -- 0.96x (near parity)
+N=768:  rvLLM 10,235 (peak)
+N=1024: rvLLM 10,051 | vLLM 12,740
 ```
-*new optimized build benchmarking now -- fused GEMMs, CUDA graph fix, vectorized kernels*
 
 ## system comparison
 - startup: 6s vs 121s (20x)

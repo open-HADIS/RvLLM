@@ -62,6 +62,15 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &["paged_attention_v2_kernel", "paged_attention_v2_f16kv_kernel"],
     ),
     (
+        "split_kv_attention",
+        &[
+            "split_kv_decode_f16kv_kernel",
+            "split_kv_combine_kernel",
+            "split_kv_decode_fp8kv_kernel",
+            "split_kv_decode_single_f16kv_kernel",
+        ],
+    ),
+    (
         "reshape_and_cache",
         &["reshape_and_cache_kernel", "reshape_and_cache_f16_kernel"],
     ),

@@ -45,8 +45,11 @@ pub struct MoELayer {
 }
 
 impl MoELayer {
-    /// Forward pass: route each token to top-k experts, combine by softmax
-    /// weight, then add shared expert output if present.
+    /// Forward pass: route tokens to top-k experts, combine by softmax weight.
+    ///
+    /// Uses batched expert execution: groups all tokens routed to each expert
+    /// and runs a single batched GEMM per expert instead of per-token serial.
+    /// Inspired by b12x's tiered MoE dispatch.
     ///
     /// input shape: [num_tokens, hidden_size]
     /// output shape: [num_tokens, hidden_size]
@@ -64,13 +67,16 @@ impl MoELayer {
             num_experts = num_experts,
             top_k = self.top_k,
             has_shared = self.shared_expert.is_some(),
-            "moe forward"
+            "moe forward (batched)"
         );
 
         // Router logits: [num_tokens, num_experts].
         let router_logits = LinearLayer::forward(input, &self.gate, None)?;
 
-        let mut output = vec![f16::ZERO; num_tokens * hidden_size];
+        // Phase 1: Compute routing -- top-k experts + softmax weights per token.
+        let mut token_experts: Vec<Vec<(usize, f32)>> = Vec::with_capacity(num_tokens);
+        // expert_tokens[e] = Vec<(token_idx, weight)>
+        let mut expert_tokens: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_experts];
 
         for t in 0..num_tokens {
             let logit_offset = t * num_experts;
@@ -78,34 +84,57 @@ impl MoELayer {
                 .map(|e| router_logits.data[logit_offset + e].to_f32())
                 .collect();
 
-            // Top-k expert selection.
             let top_indices = top_k_indices(&logits_f32, self.top_k);
             let top_logits: Vec<f32> = top_indices.iter().map(|&i| logits_f32[i]).collect();
             let weights = softmax(&top_logits);
 
-            // Single-token slice.
-            let tok_start = t * hidden_size;
-            let tok_data = input.data[tok_start..tok_start + hidden_size].to_vec();
-            let tok_buf = GpuBuffer::from_vec(tok_data, vec![1, hidden_size]);
-
-            // Accumulate weighted expert outputs.
-            let out_offset = t * hidden_size;
+            let mut tok_routes = Vec::with_capacity(self.top_k);
             for (rank, &expert_idx) in top_indices.iter().enumerate() {
-                let expert_out = self.experts[expert_idx].forward(&tok_buf)?;
-                let w = weights[rank];
-                for h in 0..hidden_size {
-                    let cur = output[out_offset + h].to_f32();
-                    output[out_offset + h] = f16::from_f32(cur + expert_out.data[h].to_f32() * w);
-                }
+                tok_routes.push((expert_idx, weights[rank]));
+                expert_tokens[expert_idx].push((t, weights[rank]));
+            }
+            token_experts.push(tok_routes);
+        }
+
+        // Phase 2: Batched expert execution -- gather tokens per expert, run GEMM.
+        // expert_outputs[e] = Vec<(token_idx, output_data)>
+        let mut output = vec![f16::ZERO; num_tokens * hidden_size];
+
+        for (expert_idx, tokens) in expert_tokens.iter().enumerate() {
+            if tokens.is_empty() {
+                continue;
             }
 
-            // Add shared expert output (unweighted, always-on).
-            if let Some(ref shared) = self.shared_expert {
-                let shared_out = shared.forward(&tok_buf)?;
+            // Gather input tokens for this expert into a batch.
+            let batch_size = tokens.len();
+            let mut batch_data = Vec::with_capacity(batch_size * hidden_size);
+            for &(tok_idx, _) in tokens {
+                let tok_start = tok_idx * hidden_size;
+                batch_data.extend_from_slice(&input.data[tok_start..tok_start + hidden_size]);
+            }
+            let batch_buf = GpuBuffer::from_vec(batch_data, vec![batch_size, hidden_size]);
+
+            // Run expert FFN on entire batch at once (single GEMM per projection).
+            let expert_out = self.experts[expert_idx].forward(&batch_buf)?;
+
+            // Scatter weighted outputs back.
+            for (batch_idx, &(tok_idx, weight)) in tokens.iter().enumerate() {
+                let src_offset = batch_idx * hidden_size;
+                let dst_offset = tok_idx * hidden_size;
                 for h in 0..hidden_size {
-                    let cur = output[out_offset + h].to_f32();
-                    output[out_offset + h] = f16::from_f32(cur + shared_out.data[h].to_f32());
+                    let cur = output[dst_offset + h].to_f32();
+                    let val = expert_out.data[src_offset + h].to_f32();
+                    output[dst_offset + h] = f16::from_f32(cur + val * weight);
                 }
+            }
+        }
+
+        // Phase 3: Shared expert (always-on, batched over all tokens).
+        if let Some(ref shared) = self.shared_expert {
+            let shared_out = shared.forward(input)?;
+            for i in 0..output.len() {
+                let cur = output[i].to_f32();
+                output[i] = f16::from_f32(cur + shared_out.data[i].to_f32());
             }
         }
 

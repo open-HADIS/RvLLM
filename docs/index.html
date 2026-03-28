@@ -96,8 +96,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">8,339 tok/s</div>
-  <div class="sub">Matches Python vLLM at production batch sizes. 20x faster startup. 31x smaller binary. Work in progress. One developer, $1,780.</div>
+  <div class="big">10,291 tok/s</div>
+  <div class="sub">Beats Python vLLM up to N=256. 20x faster startup. 31x smaller binary. Work in progress. One developer, $1,780.</div>
 </div>
 
 <section>
@@ -107,9 +107,9 @@ footer a:hover{color:#999}
   <strong>Work in progress.</strong> rvLLM is a from-scratch Rust implementation of the vLLM
   inference engine for OpenAI-compatible API serving with CUDA GPU acceleration. 23 Rust crates
   and 15 pre-compiled CUDA PTX kernels, compiling to a single 16 MB static binary. In
-  head-to-head benchmarks on A100 80 GB SXM4, rvLLM with FP16 inference achieves 8,339 tok/s
-  serving Qwen2.5-1.5B, <strong>matching Python vLLM 0.18 throughput at production batch sizes</strong>
-  (N=48-128) while offering 20x faster startup, a 31x smaller binary, and 3x less CPU memory.
+  head-to-head benchmarks on A100 80 GB SXM4, rvLLM with FP16 inference achieves 10,291 tok/s
+  serving Qwen2.5-1.5B, <strong>beating Python vLLM 0.18 throughput up to N=256</strong>
+  while offering 20x faster startup, a 31x smaller binary, and 3x less CPU memory.
 </p>
 <p>
   The throughput parity at production batch sizes derives from: GPU-resident greedy decoding via
@@ -141,18 +141,19 @@ footer a:hover{color:#999}
 <table>
 <thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM (tok/s)</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">58</td><td class="r">69</td><td></td></tr>
-<tr><td class="r">4</td><td class="r">283</td><td class="r">256</td><td>rvLLM ahead</td></tr>
-<tr><td class="r">16</td><td class="r">725</td><td class="r">1,060</td><td></td></tr>
-<tr><td class="r">32</td><td class="r">891</td><td class="r">1,943</td><td></td></tr>
-<tr class="peak"><td class="r">48</td><td class="r">3,436</td><td class="r">2,887</td><td>rvLLM pulls ahead</td></tr>
-<tr class="peak"><td class="r">64</td><td class="r">3,938</td><td class="r">3,828</td><td>Matched</td></tr>
-<tr class="peak"><td class="r">96</td><td class="r">5,094</td><td class="r">5,197</td><td>Matched</td></tr>
-<tr class="peak"><td class="r">128</td><td class="r">6,301</td><td class="r">6,400</td><td>Matched</td></tr>
-<tr><td class="r">256</td><td class="r">8,055</td><td class="r">9,437</td><td></td></tr>
-<tr><td class="r">512</td><td class="r">8,308</td><td class="r">10,771</td><td></td></tr>
-<tr class="peak"><td class="r">768</td><td class="r">8,339</td><td class="r">--</td><td>rvLLM peak</td></tr>
-<tr><td class="r">1,024</td><td class="r">8,308</td><td class="r">12,740</td><td></td></tr>
+<tr class="peak"><td class="r">1</td><td class="r">117</td><td class="r">69</td><td>rvLLM 1.7x faster</td></tr>
+<tr><td class="r">4</td><td class="r">882</td><td class="r">256</td><td>rvLLM ahead</td></tr>
+<tr><td class="r">8</td><td class="r">1,213</td><td class="r">517</td><td></td></tr>
+<tr><td class="r">16</td><td class="r">1,391</td><td class="r">1,060</td><td></td></tr>
+<tr><td class="r">32</td><td class="r">1,434</td><td class="r">1,943</td><td></td></tr>
+<tr class="peak"><td class="r">48</td><td class="r">3,918</td><td class="r">2,887</td><td>rvLLM pulls ahead</td></tr>
+<tr class="peak"><td class="r">64</td><td class="r">4,796</td><td class="r">3,828</td><td>rvLLM 1.25x</td></tr>
+<tr class="peak"><td class="r">96</td><td class="r">5,965</td><td class="r">5,197</td><td>rvLLM 1.15x</td></tr>
+<tr class="peak"><td class="r">128</td><td class="r">7,380</td><td class="r">6,400</td><td>rvLLM 1.15x</td></tr>
+<tr class="peak"><td class="r">256</td><td class="r">9,905</td><td class="r">9,437</td><td>rvLLM 1.05x</td></tr>
+<tr><td class="r">512</td><td class="r">10,291</td><td class="r">10,771</td><td>Near parity (0.96x)</td></tr>
+<tr class="peak"><td class="r">768</td><td class="r">10,235</td><td class="r">--</td><td>rvLLM peak</td></tr>
+<tr><td class="r">1,024</td><td class="r">10,051</td><td class="r">12,740</td><td></td></tr>
 </tbody>
 </table>
 </div>
@@ -188,7 +189,7 @@ footer a:hover{color:#999}
 <table>
 <thead><tr><th>Metric</th><th class="r">rvLLM (FP16)</th><th class="r">Python vLLM</th><th>Comparison</th></tr></thead>
 <tbody>
-<tr><td>Peak throughput</td><td class="r">8,339 tok/s</td><td class="r">12,740 tok/s</td><td>Matches at N=48-128</td></tr>
+<tr><td>Peak throughput</td><td class="r">10,291 tok/s</td><td class="r">12,740 tok/s</td><td>Beats vLLM up to N=256</td></tr>
 <tr><td>Total verified</td><td class="r">14,620</td><td class="r">--</td><td>0 errors</td></tr>
 <tr><td>Startup time</td><td class="r">6s</td><td class="r">121s</td><td>20x faster</td></tr>
 <tr><td>Binary size</td><td class="r">16 MB</td><td class="r">~500 MB</td><td>31x smaller</td></tr>

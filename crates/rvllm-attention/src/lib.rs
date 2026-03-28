@@ -15,8 +15,9 @@ pub mod paged_attention;
 #[cfg(feature = "cuda")]
 pub mod paged_attention_cuda;
 pub mod sliding_window;
+pub mod split_kv;
 
-pub use backend::{select_backend, AttentionBackend};
+pub use backend::{select_backend, select_backend_with_options, AttentionBackend};
 pub use buffer::GpuBuffer;
 pub use flash_attention::FlashAttentionPaged;
 pub use flash_attention_impl::{FlashAttention2, FlashAttention2Config};
@@ -26,3 +27,4 @@ pub use paged_attention::PagedAttentionV2;
 #[cfg(feature = "cuda")]
 pub use paged_attention_cuda::CudaPagedAttention;
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowConfig};
+pub use split_kv::{choose_num_splits, SplitKvAttention};

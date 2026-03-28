@@ -6,6 +6,7 @@ use rvllm_core::prelude::Result;
 
 use crate::flash_attention_impl::FlashAttention2;
 use crate::paged_attention::PagedAttentionV2;
+use crate::split_kv::SplitKvAttention;
 
 /// Trait for pluggable attention backends.
 ///
@@ -42,9 +43,32 @@ pub trait AttentionBackend: Send + Sync {
 /// Returns `FlashAttention2` (CPU reference) for SM >= 8.0, `PagedAttentionV2` otherwise.
 /// When the `cuda` feature is enabled, use `FlashAttention2::with_cuda()` directly
 /// to get the GPU-accelerated kernel path.
+/// Select the best attention backend for the given compute capability.
+///
+/// For SM >= 8.0 (Ampere+), uses SplitKvAttention which distributes KV blocks
+/// across multiple thread blocks for better high-concurrency scaling.
+/// Falls back to PagedAttentionV2 for older GPUs.
+///
+/// When the `cuda` feature is enabled, the CUDA-backed variants are used.
+/// The `use_split_kv` parameter allows callers to force or disable split-KV.
 pub fn select_backend(compute_capability: (u32, u32)) -> Box<dyn AttentionBackend> {
+    select_backend_with_options(compute_capability, true)
+}
+
+/// Select backend with explicit control over split-KV.
+pub fn select_backend_with_options(
+    compute_capability: (u32, u32),
+    use_split_kv: bool,
+) -> Box<dyn AttentionBackend> {
     let (major, minor) = compute_capability;
-    if major >= 8 {
+    if major >= 8 && use_split_kv {
+        tracing::info!(
+            backend = "SplitKvAttention",
+            sm = %format!("{major}.{minor}"),
+            "selected split-KV attention backend"
+        );
+        Box::new(SplitKvAttention::new())
+    } else if major >= 8 {
         tracing::info!(
             backend = "FlashAttention2",
             sm = %format!("{major}.{minor}"),
@@ -66,26 +90,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn select_flash_for_sm80() {
+    fn select_split_kv_for_sm80() {
         let backend = select_backend((8, 0));
-        assert_eq!(backend.name(), "FlashAttention2-CPU");
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
     }
 
     #[test]
-    fn select_flash_for_sm90() {
+    fn select_split_kv_for_sm90() {
         let backend = select_backend((9, 0));
-        assert_eq!(backend.name(), "FlashAttention2-CPU");
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
     }
 
     #[test]
-    fn select_flash_for_sm120_blackwell() {
+    fn select_split_kv_for_sm120_blackwell() {
         let backend = select_backend((12, 0));
-        assert_eq!(backend.name(), "FlashAttention2-CPU");
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
     }
 
     #[test]
-    fn select_flash_for_sm122_blackwell() {
-        let backend = select_backend((12, 2));
+    fn select_flash_when_split_kv_disabled() {
+        let backend = select_backend_with_options((8, 0), false);
         assert_eq!(backend.name(), "FlashAttention2-CPU");
     }
 
