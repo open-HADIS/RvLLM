@@ -14,10 +14,17 @@ use crate::Result;
 /// These are the `extern "C" __global__` entry points in each .cu file.
 static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     ("activation", &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"]),
+    ("activation_f16", &["silu_f16_kernel", "fused_silu_mul_f16_kernel", "gelu_f16_kernel"]),
+    ("add_bias", &["add_bias_kernel", "add_kernel"]),
     ("copy_blocks", &["copy_blocks_kernel"]),
+    ("embedding_gather", &["embedding_gather_kernel"]),
     ("flash_attention", &["flash_attention_2_kernel", "flash_attention_2_decode_kernel"]),
+    ("fp8_kv", &["quantize_kv_kernel", "dequantize_kv_kernel", "quantize_paged_kv_kernel", "dequantize_paged_kv_kernel"]),
+    ("fused_residual_rmsnorm", &["fused_residual_rmsnorm_kernel"]),
     ("paged_attention", &["paged_attention_v2_kernel"]),
+    ("reshape_and_cache", &["reshape_and_cache_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),
+    ("rms_norm_f16", &["rms_norm_f16_kernel"]),
     ("rotary_embedding", &["rotary_embedding_kernel"]),
     ("softmax", &["softmax_kernel"]),
 ];

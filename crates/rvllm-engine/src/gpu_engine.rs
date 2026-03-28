@@ -326,6 +326,12 @@ mod inner {
             worker.load_weights(&model_dir)?;
             info!("model weights loaded successfully");
 
+            // 8. Profile GPU memory and init KV cache + GPU model runner
+            let (num_gpu_blocks, num_cpu_blocks) = worker.profile_num_available_blocks(
+                config.cache.gpu_memory_utilization,
+            )?;
+            worker.init_cache(num_gpu_blocks, num_cpu_blocks)?;
+
             // 8. Scheduler
             let scheduler = FifoScheduler::new(
                 config.scheduler.max_num_seqs,
@@ -458,8 +464,10 @@ mod inner {
                 }
             }
 
+            info!(num_groups = metadata.len(), "gpu_engine: calling worker.execute");
             let worker_outputs = self.worker.execute(&metadata)
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
+            info!(num_outputs = worker_outputs.outputs.len(), "gpu_engine: worker.execute returned");
 
             // Prefix caching: after prefill, register new prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {

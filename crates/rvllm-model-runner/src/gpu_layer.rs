@@ -18,8 +18,8 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _, LaunchAsync, LaunchConfig};
-    use tracing::trace;
+    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
+    use tracing::{info, trace};
 
     use rvllm_core::error::{LLMError, Result};
     use rvllm_gpu::cublas::CublasHandle;
@@ -81,6 +81,12 @@ mod inner {
         pub max_context_len: u32,
         /// Block size for paged attention.
         pub block_size: usize,
+        /// True during prefill (prompt processing), false during decode.
+        pub is_prefill: bool,
+        /// RoPE cos table on GPU: [max_position, head_dim/2].
+        pub rope_cos: &'a CudaSlice<f32>,
+        /// RoPE sin table on GPU: [max_position, head_dim/2].
+        pub rope_sin: &'a CudaSlice<f32>,
     }
 
     /// One complete GPU transformer layer.
@@ -153,6 +159,8 @@ mod inner {
                 &q,
                 &k,
                 input.positions,
+                input.rope_cos,
+                input.rope_sin,
                 num_tokens,
                 num_heads,
                 num_kv_heads,
@@ -160,26 +168,44 @@ mod inner {
             )?;
 
             // ---------------------------------------------------------------
-            // 4. Paged Attention
+            // 4. KV cache write + Attention (prefill vs decode)
             // ---------------------------------------------------------------
-            let attn_out = Self::paged_attention(
+            // Always write K/V into paged cache via slot_mapping
+            info!(layer = cfg.layer_idx, "gpu_layer: cache_write start");
+            Self::cache_write(
                 &self.device,
-                &q_rot,
-                &k_rot,
-                &v,
-                input.key_cache,
-                input.value_cache,
-                input.block_tables,
-                input.context_lens,
+                &k_rot, &v,
+                input.key_cache, input.value_cache,
                 input.slot_mapping,
-                num_tokens,
-                input.num_seqs,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                input.max_context_len,
-                input.block_size,
+                num_tokens, num_kv_heads, head_dim,
             )?;
+
+            info!(layer = cfg.layer_idx, "gpu_layer: cache_write done");
+
+            let attn_out = if input.is_prefill {
+                // Prefill: read from paged cache (K/V already written above)
+                info!(layer = cfg.layer_idx, "gpu_layer: prefill_attention start");
+                Self::prefill_attention(
+                    &self.device, &q_rot,
+                    input.key_cache, input.value_cache,
+                    input.block_tables, input.context_lens,
+                    num_tokens, input.num_seqs,
+                    num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size,
+                )?
+            } else {
+                // Decode: read from paged cache
+                info!(layer = cfg.layer_idx, "gpu_layer: decode_attention start");
+                Self::decode_attention(
+                    &self.device,
+                    &q_rot,
+                    input.key_cache, input.value_cache,
+                    input.block_tables, input.context_lens,
+                    num_tokens, input.num_seqs,
+                    num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size,
+                )?
+            };
 
             // ---------------------------------------------------------------
             // 5. Output projection
@@ -322,11 +348,16 @@ mod inner {
         /// Q shape: [num_tokens, num_heads * head_dim]
         /// K shape: [num_tokens, num_kv_heads * head_dim]
         /// positions: [num_tokens]
+        /// Apply RoPE to Q and K in a single kernel launch.
+        /// Kernel signature: (query, key, cos_cache, sin_cache, positions,
+        ///                     num_tokens, num_heads, num_kv_heads, head_dim)
         fn apply_rotary_embedding(
             device: &Arc<CudaDevice>,
             q: &CudaSlice<f32>,
             k: &CudaSlice<f32>,
             positions: &CudaSlice<u32>,
+            rope_cos: &CudaSlice<f32>,
+            rope_sin: &CudaSlice<f32>,
             num_tokens: usize,
             num_heads: usize,
             num_kv_heads: usize,
@@ -338,51 +369,45 @@ mod inner {
             // Clone Q and K so we can apply rotation in-place.
             let mut q_out = device
                 .alloc_zeros::<f32>(q_len)
-                .map_err(|e| LLMError::GpuError(format!("rope q alloc failed: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("rope q alloc: {e}")))?;
             let mut k_out = device
                 .alloc_zeros::<f32>(k_len)
-                .map_err(|e| LLMError::GpuError(format!("rope k alloc failed: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("rope k alloc: {e}")))?;
 
-            // Copy input to output buffers (dtod).
             device.dtod_copy(q, &mut q_out)
-                .map_err(|e| LLMError::GpuError(format!("rope q copy failed: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("rope q copy: {e}")))?;
             device.dtod_copy(k, &mut k_out)
-                .map_err(|e| LLMError::GpuError(format!("rope k copy failed: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("rope k copy: {e}")))?;
 
-            let module_name = "rotary_embedding";
-            let func_name = "rotary_embedding_kernel";
+            let kernel = device
+                .get_func("rotary_embedding", "rotary_embedding_kernel")
+                .ok_or_else(|| LLMError::GpuError("rotary_embedding_kernel not loaded".into()))?;
 
-            // Launch for Q: one block per (token, head), head_dim/2 threads.
+            // Single launch: grid (num_tokens, max(num_heads, num_kv_heads), 1)
+            // The kernel internally guards `if (head_idx < num_kv_heads)` for K.
             let half_dim = head_dim / 2;
-            let q_cfg = LaunchConfig {
-                grid_dim: (num_tokens as u32, num_heads as u32, 1),
+            let grid_y = num_heads.max(num_kv_heads) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, grid_y, 1),
                 block_dim: (half_dim.min(1024) as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let kernel_q = device
-                .get_func(module_name, func_name)
-                .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
-            // SAFETY: q_out has exactly q_len elements, positions has num_tokens elements.
-            // Grid covers all (token, head) pairs; each thread handles one frequency.
-            unsafe {
-                kernel_q
-                    .launch(q_cfg, (&mut q_out, positions, head_dim as u32, num_heads as u32))
-                    .map_err(|e| LLMError::GpuError(format!("rope q launch failed: {e}")))?;
-            }
 
-            // Launch for K.
-            let k_cfg = LaunchConfig {
-                grid_dim: (num_tokens as u32, num_kv_heads as u32, 1),
-                block_dim: (half_dim.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let kernel_k = device
-                .get_func(module_name, func_name)
-                .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded (k)")))?;
-            // SAFETY: k_out has exactly k_len elements. Same contract as Q launch.
+            // positions is u32 on GPU but kernel expects int* (i32).
+            // They're the same size; cast is safe.
             unsafe {
-                kernel_k
-                    .launch(k_cfg, (&mut k_out, positions, head_dim as u32, num_kv_heads as u32))
+                kernel
+                    .launch(cfg, (
+                        &mut q_out,
+                        &mut k_out,
+                        rope_cos,
+                        rope_sin,
+                        positions, // u32 == i32 in CUDA ABI
+                        num_tokens as i32,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        head_dim as i32,
+                    ))
                     .map_err(|e| LLMError::GpuError(format!("rope k launch failed: {e}")))?;
             }
 
@@ -394,16 +419,175 @@ mod inner {
         /// Writes new K,V into the cache at slot_mapping positions,
         /// then runs the paged_attention kernel for the actual attention computation.
         #[allow(clippy::too_many_arguments)]
-        fn paged_attention(
+        /// Write per-token K/V into paged cache using slot_mapping.
+        /// Uses reshape_and_cache_kernel: 1 launch per layer.
+        fn cache_write(
             device: &Arc<CudaDevice>,
-            q: &CudaSlice<f32>,
             k: &CudaSlice<f32>,
             v: &CudaSlice<f32>,
             key_cache: &CudaSlice<f32>,
             value_cache: &CudaSlice<f32>,
+            slot_mapping: &CudaSlice<u32>,
+            num_tokens: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            let kernel = device
+                .get_func("reshape_and_cache", "reshape_and_cache_kernel")
+                .ok_or_else(|| LLMError::GpuError("reshape_and_cache_kernel not loaded".into()))?;
+
+            let kv_dim = num_kv_heads * head_dim;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (kv_dim.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            // Kernel signature: (key_cache, value_cache, key, value, slot_mapping, num_tokens, num_kv_heads, head_dim)
+            // All int args are i32.
+            unsafe {
+                kernel.launch(cfg, (
+                    key_cache,
+                    value_cache,
+                    k,
+                    v,
+                    slot_mapping,
+                    num_tokens as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                )).map_err(|e| LLMError::GpuError(format!("reshape_and_cache launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// Prefill attention: write K/V to cache, then launch flash_attention_2_kernel
+        /// reading from the paged cache with real block_tables.
+        fn prefill_attention(
+            device: &Arc<CudaDevice>,
+            q: &CudaSlice<f32>,
+            key_cache: &CudaSlice<f32>,
+            value_cache: &CudaSlice<f32>,
             block_tables: &CudaSlice<u32>,
             context_lens: &CudaSlice<u32>,
-            _slot_mapping: &CudaSlice<u32>,
+            num_tokens: usize,
+            num_seqs: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+            max_context_len: u32,
+            block_size: usize,
+        ) -> Result<CudaSlice<f32>> {
+            let out_len = num_tokens * num_heads * head_dim;
+            let output = device
+                .alloc_zeros::<f32>(out_len)
+                .map_err(|e| LLMError::GpuError(format!("prefill_attn alloc: {e}")))?;
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            const FA2_BC: usize = 64;
+            const FA2_THREADS: u32 = 128;
+            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32)) * std::mem::size_of::<f32>()) as u32;
+
+            let kernel = device
+                .get_func("flash_attention", "flash_attention_2_kernel")
+                .ok_or_else(|| LLMError::GpuError("flash_attention_2_kernel not loaded".into()))?;
+
+            let bt_len = DeviceSlice::len(block_tables);
+            info!(
+                num_tokens, num_seqs, num_heads, num_kv_heads, head_dim,
+                block_size, max_context_len, bt_len,
+                shared_mem_bytes,
+                "prefill_attention: dimensions"
+            );
+
+            if num_seqs == 0 {
+                return Err(LLMError::GpuError("prefill_attention: num_seqs == 0".into()));
+            }
+
+            let cfg = LaunchConfig {
+                grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                block_dim: (FA2_THREADS, 1, 1),
+                shared_mem_bytes,
+            };
+
+            // Build seq_start_pos from context_lens (cumulative prefix sum on CPU, upload)
+            let ctx_host = device.dtoh_sync_copy(context_lens)
+                .map_err(|e| LLMError::GpuError(format!("context_lens DtoH: {e}")))?;
+            let mut seq_starts = Vec::with_capacity(num_seqs);
+            let mut pos = 0i32;
+            for &cl in &ctx_host {
+                seq_starts.push(pos);
+                pos += cl as i32;
+            }
+            let seq_start_pos_gpu: CudaSlice<i32> = device.htod_sync_copy(&seq_starts)
+                .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
+
+            let max_blocks_per_seq = if num_seqs > 0 {
+                (DeviceSlice::len(block_tables) / num_seqs) as i32
+            } else {
+                1
+            };
+
+            // Opt into extended shared memory if needed (A100 supports up to 100KB)
+            if shared_mem_bytes > 49152 {
+                kernel.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                ).map_err(|e| LLMError::GpuError(format!("prefill FA2 set max shared mem: {e}")))?;
+            }
+
+            // FA2 prefill kernel: 16 args, use raw void** launch (exceeds tuple limit)
+            unsafe {
+                use cudarc::driver::DevicePtr;
+                let mut out_ptr = *DevicePtr::device_ptr(&output);
+                let mut q_ptr = *DevicePtr::device_ptr(q);
+                let mut kc_ptr = *DevicePtr::device_ptr(key_cache);
+                let mut vc_ptr = *DevicePtr::device_ptr(value_cache);
+                let mut bt_ptr = *DevicePtr::device_ptr(block_tables);
+                let mut cl_ptr = *DevicePtr::device_ptr(context_lens);
+                let mut ss_ptr = *DevicePtr::device_ptr(&seq_start_pos_gpu);
+                let mut p_scale = scale;
+                let mut p_num_heads = num_heads as i32;
+                let mut p_num_kv = num_kv_heads as i32;
+                let mut p_head_dim = head_dim as i32;
+                let mut p_block_size = block_size as i32;
+                let mut p_max_ctx = max_context_len as i32;
+                let mut p_max_blocks = max_blocks_per_seq;
+                let mut p_num_tokens = num_tokens as i32;
+                let mut p_causal = 1i32;
+                let params: &mut [*mut std::ffi::c_void] = &mut [
+                    &mut out_ptr as *mut _ as *mut _,
+                    &mut q_ptr as *mut _ as *mut _,
+                    &mut kc_ptr as *mut _ as *mut _,
+                    &mut vc_ptr as *mut _ as *mut _,
+                    &mut bt_ptr as *mut _ as *mut _,
+                    &mut cl_ptr as *mut _ as *mut _,
+                    &mut ss_ptr as *mut _ as *mut _,
+                    &mut p_scale as *mut _ as *mut _,
+                    &mut p_num_heads as *mut _ as *mut _,
+                    &mut p_num_kv as *mut _ as *mut _,
+                    &mut p_head_dim as *mut _ as *mut _,
+                    &mut p_block_size as *mut _ as *mut _,
+                    &mut p_max_ctx as *mut _ as *mut _,
+                    &mut p_max_blocks as *mut _ as *mut _,
+                    &mut p_num_tokens as *mut _ as *mut _,
+                    &mut p_causal as *mut _ as *mut _,
+                ];
+                kernel.launch(cfg, params)
+                    .map_err(|e| LLMError::GpuError(format!("prefill FA2 launch: {e}")))?;
+            }
+
+            Ok(output)
+        }
+
+        /// Decode attention: read K/V from paged cache, one FA2 decode kernel per layer.
+        fn decode_attention(
+            device: &Arc<CudaDevice>,
+            q: &CudaSlice<f32>,
+            key_cache: &CudaSlice<f32>,
+            value_cache: &CudaSlice<f32>,
+            block_tables: &CudaSlice<u32>,
+            context_lens: &CudaSlice<u32>,
             num_tokens: usize,
             num_seqs: usize,
             num_heads: usize,
@@ -438,6 +622,14 @@ mod inner {
             let kernel = device
                 .get_func(module_name, func_name)
                 .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
+
+            // Opt into extended shared memory if needed
+            if shared_mem_bytes > 49152 {
+                kernel.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                ).map_err(|e| LLMError::GpuError(format!("decode FA2 set max shared mem: {e}")))?;
+            }
 
             // SAFETY: All slices are valid GPU memory on this device.
             // output: [num_seqs, num_heads, head_dim]

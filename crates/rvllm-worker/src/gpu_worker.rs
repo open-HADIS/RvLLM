@@ -286,6 +286,13 @@ pub struct GpuWorker {
     use_fp8_kv: bool,
     guided_states: HashMap<u64, GuidedDecodingState>,
     vocab_table: Option<VocabTable>,
+    /// Raw weight map preserved for deferred GpuModelRunner construction.
+    #[cfg(feature = "cuda")]
+    raw_weight_map: Option<HashMap<String, CudaSlice<f32>>>,
+    /// GPU-resident model runner (full forward pass on GPU, no CPU attention fallback).
+    /// Constructed in init_cache() once cache geometry is known.
+    #[cfg(feature = "cuda")]
+    gpu_model_runner: Option<rvllm_model_runner::gpu_runner::GpuModelRunner>,
 }
 
 impl GpuWorker {
@@ -335,6 +342,10 @@ impl GpuWorker {
             use_fp8_kv,
             guided_states: HashMap::new(),
             vocab_table: None,
+            #[cfg(feature = "cuda")]
+            raw_weight_map: None,
+            #[cfg(feature = "cuda")]
+            gpu_model_runner: None,
         })
     }
 
@@ -348,12 +359,20 @@ impl GpuWorker {
     pub fn load_weights(&mut self, model_path: &Path) -> Result<()> {
         info!(device_id = self.device_id, path = %model_path.display(), "loading weights to GPU");
 
-        let mut all_weights = rvllm_model_loader::gpu_loader::load_weights_to_gpu(
+        let all_weights_full = rvllm_model_loader::gpu_loader::load_weights_to_gpu(
             model_path,
             &self.device,
         ).map_err(|e| LLMError::GpuError(format!("weight loading failed: {e}")))?;
 
-        info!("loaded {} weight tensors to GPU", all_weights.len());
+        info!("loaded {} weight tensors to GPU", all_weights_full.len());
+
+        // Preserve a clone of the raw weight map for deferred GpuModelRunner construction
+        #[cfg(feature = "cuda")]
+        {
+            self.raw_weight_map = Some(all_weights_full.clone());
+        }
+
+        let mut all_weights = all_weights_full;
 
         let tie = !all_weights.contains_key("lm_head.weight");
         info!(tie_word_embeddings = tie, "building model weight structure");
@@ -436,11 +455,80 @@ impl GpuWorker {
     /// Allocate GPU and CPU KV cache blocks after profiling available memory.
     pub fn init_cache(
         &mut self,
-        _num_gpu_blocks: usize,
-        _num_cpu_blocks: usize,
+        num_gpu_blocks: usize,
+        num_cpu_blocks: usize,
     ) -> Result<()> {
-        info!(device_id = self.device_id, "GpuWorker KV cache init (stub)");
+        info!(device_id = self.device_id, num_gpu_blocks, num_cpu_blocks, "GpuWorker init_cache");
+
+        #[cfg(feature = "cuda")]
+        {
+            use rvllm_model_loader::gpu_weights::GpuModelWeights as LoaderWeights;
+
+            let raw_map = self.raw_weight_map.take()
+                .ok_or_else(|| LLMError::GpuError("raw weight map not available -- call load_weights first".into()))?;
+            let loader_weights = LoaderWeights::new(raw_map, HashMap::new());
+
+            let block_size = self.config.block_size;
+            let cache = rvllm_kv_cache::engine_cuda::CudaCacheEngine::new(
+                self.config.num_layers,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                block_size,
+                num_gpu_blocks,
+                num_cpu_blocks,
+                self.device.clone(),
+            ).map_err(|e| LLMError::GpuError(format!("CudaCacheEngine init: {e}")))?;
+
+            let runner_blas = CublasHandle::new(self.device.clone())
+                .map_err(|e| LLMError::GpuError(format!("runner cublas: {e}")))?;
+
+            // KernelLoader: try build output dir, fall back to empty (PTX loaded at runtime)
+            let ptx_dir = Self::find_ptx_dir();
+            let loader = rvllm_gpu::kernel_loader::KernelLoader::new(
+                self.device.clone(),
+                &ptx_dir.unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
+            ).map_err(|e| LLMError::GpuError(format!("kernel loader: {e}")))?;
+
+            let mr_config = self.config.model_runner_config();
+            let runner = rvllm_model_runner::gpu_runner::GpuModelRunner::new(
+                loader_weights,
+                cache,
+                runner_blas,
+                loader,
+                mr_config,
+                self.device.clone(),
+            )?;
+
+            self.gpu_model_runner = Some(runner);
+            info!("GPU model runner initialized with {} GPU blocks (block_size={})", num_gpu_blocks, block_size);
+        }
+
         Ok(())
+    }
+
+    /// Search for compiled PTX directory from build output.
+    #[cfg(feature = "cuda")]
+    fn find_ptx_dir() -> Option<std::path::PathBuf> {
+        for base in &[
+            "/root/vllm-rs/target/release/build",
+            "/root/vllm-rs/target/debug/build",
+            "./target/release/build",
+            "./target/debug/build",
+        ] {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                for entry in entries.flatten() {
+                    let ptx_path = entry.path().join("out/ptx");
+                    if ptx_path.join("rotary_embedding.ptx").exists() {
+                        return Some(ptx_path);
+                    }
+                }
+            }
+        }
+        if let Ok(dir) = std::env::var("RVLLM_PTX_DIR") {
+            let p = std::path::PathBuf::from(dir);
+            if p.exists() { return Some(p); }
+        }
+        None
     }
 
     /// Profile available GPU memory and return (num_gpu_blocks, num_cpu_blocks).
@@ -456,7 +544,10 @@ impl GpuWorker {
         let cache_cfg = self.config.cache_config();
         let total_block_bytes = cache_cfg.total_block_bytes();
 
-        let num_gpu_blocks = if total_block_bytes > 0 { available / total_block_bytes } else { 0 };
+        // CudaCacheEngine allocates f32, but CacheConfig::block_bytes assumes f16.
+        // Multiply by 2 to account for the f32/f16 mismatch until cache dtype is unified.
+        let effective_block_bytes = total_block_bytes * 2;
+        let num_gpu_blocks = if effective_block_bytes > 0 { available / effective_block_bytes } else { 0 };
         let num_cpu_blocks = 128;
 
         info!(free, available, num_gpu_blocks, num_cpu_blocks, "profiled available blocks");
@@ -490,7 +581,9 @@ impl GpuWorker {
         debug!(num_tokens = total_tokens, is_prefill = model_input.is_prefill, "input prepared");
 
         // Run real GPU forward pass with RoPE and KV cache
+        info!("gpu_worker: entering gpu_forward");
         let logits = self.gpu_forward(&model_input)?;
+        info!(logits_len = logits.len(), "gpu_worker: gpu_forward returned");
 
         // Sample tokens from logits
         let outputs = self.sample_tokens(&logits, metadata)?;
@@ -510,8 +603,34 @@ impl GpuWorker {
         self.execute(metadata)
     }
 
-    /// Real GPU forward pass: embed -> transformer layers (with RoPE + KV cache) -> LM head.
+    /// Real GPU forward pass: delegates to GpuModelRunner for full GPU-resident inference.
     fn gpu_forward(&mut self, model_input: &ModelInput) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        {
+            let runner = self.gpu_model_runner.as_ref()
+                .ok_or_else(|| LLMError::GpuError(
+                    "GPU model runner not initialized -- build with --features cuda".into()
+                ))?;
+
+            return runner.forward(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                model_input.is_prefill,
+            );
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err(LLMError::GpuError(
+                "GPU forward pass requires --features cuda. CPU fallback is disabled.".into()
+            ));
+        }
+    }
+
+    /// Legacy CPU forward pass (kept for comparison benchmarks only, not used in production).
+    #[allow(dead_code)]
+    fn gpu_forward_cpu_attention(&mut self, model_input: &ModelInput) -> Result<Vec<f32>> {
         if self.model_weights.is_none() {
             return Err(LLMError::GpuError("model not loaded".into()));
         }
@@ -540,7 +659,7 @@ impl GpuWorker {
         let cache_len = self.kv_cache.as_ref().map(|c| c.len())
             .or_else(|| self.fp8_kv_cache.as_ref().map(|c| c.len()))
             .unwrap_or(0);
-        debug!(num_tokens, is_prefill, "gpu_forward: cache_len={}", cache_len);
+        debug!(num_tokens, is_prefill, "gpu_forward_cpu_attention: cache_len={}", cache_len);
 
         // 1. Embedding lookup (GPU gather when kernel available, else CPU fallback)
         let mut hidden = {
@@ -707,7 +826,6 @@ impl GpuWorker {
         }
 
         // 5. KV Cache: append new K,V, then use full cache for attention
-        //    FP8 path: quantize before storing, dequantize before attention
         let (full_k, full_v, total_kv_len) = if let Some(ref mut cache) = self.fp8_kv_cache {
             cache.append_quantized(layer_idx, &k_host, &v_host);
             let total_len = cache.len() + num_tokens;
@@ -724,7 +842,7 @@ impl GpuWorker {
             (k_host, v_host, num_tokens)
         };
 
-        // 6. Attention: Q=[num_tokens, q_dim], K=[total_kv_len, kv_dim], V=[total_kv_len, kv_dim]
+        // 6. Attention (CPU)
         let attn_output = self.cached_attention(
             &q_host, &full_k, &full_v,
             num_tokens, total_kv_len,

@@ -15,7 +15,7 @@ mod cuda_impl {
     use std::sync::Arc;
 
     use cudarc::driver::{CudaDevice, CudaSlice, CudaStream};
-    use tracing::{debug, trace};
+    use tracing::{debug, info, trace};
 
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
@@ -41,6 +41,10 @@ mod cuda_impl {
         final_norm_weight: CudaSlice<f32>,
         lm_head_weight: CudaSlice<f32>,
         rms_norm_eps: f32,
+        /// Precomputed RoPE cos table on GPU: [max_position, head_dim/2]
+        rope_cos: CudaSlice<f32>,
+        /// Precomputed RoPE sin table on GPU: [max_position, head_dim/2]
+        rope_sin: CudaSlice<f32>,
     }
 
     impl GpuModelRunner {
@@ -75,7 +79,8 @@ mod cuda_impl {
 
             let lm_head_weight = weights
                 .get("lm_head.weight")
-                .ok_or_else(|| LLMError::GpuError("missing lm_head.weight".into()))?
+                .or_else(|| weights.get("model.embed_tokens.weight"))
+                .ok_or_else(|| LLMError::GpuError("missing lm_head.weight and model.embed_tokens.weight".into()))?
                 .clone();
 
             let mut layers = Vec::with_capacity(config.num_layers);
@@ -92,6 +97,27 @@ mod cuda_impl {
                 layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&device)));
             }
 
+            // Precompute RoPE cos/sin tables
+            let head_dim = config.head_dim;
+            let max_pos = config.max_position.min(8192);
+            let half_dim = head_dim / 2;
+            let rope_theta = 1_000_000.0f32; // Qwen2.5 default
+            let mut cos_table = vec![0.0f32; max_pos * half_dim];
+            let mut sin_table = vec![0.0f32; max_pos * half_dim];
+            for pos in 0..max_pos {
+                for i in 0..half_dim {
+                    let freq = 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32);
+                    let theta = pos as f32 * freq;
+                    cos_table[pos * half_dim + i] = theta.cos();
+                    sin_table[pos * half_dim + i] = theta.sin();
+                }
+            }
+            let rope_cos = device.htod_sync_copy(&cos_table)
+                .map_err(|e| LLMError::GpuError(format!("rope cos HtoD: {e}")))?;
+            let rope_sin = device.htod_sync_copy(&sin_table)
+                .map_err(|e| LLMError::GpuError(format!("rope sin HtoD: {e}")))?;
+            info!(max_pos, half_dim, "RoPE tables uploaded to GPU");
+
             Ok(Self {
                 weights,
                 cache,
@@ -105,6 +131,8 @@ mod cuda_impl {
                 final_norm_weight,
                 lm_head_weight,
                 rms_norm_eps: 1e-5_f32,
+                rope_cos,
+                rope_sin,
             })
         }
 
@@ -112,11 +140,11 @@ mod cuda_impl {
             &self,
             token_ids: &[u32],
             positions: &[u32],
-            block_tables: &[Vec<u32>],
-            context_lens: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            is_prefill: bool,
         ) -> Result<Vec<f32>> {
             let num_tokens = token_ids.len();
-            let num_seqs = context_lens.len();
+            let num_seqs = attn_meta.context_lens.len();
             let hidden_size = self.config.hidden_size;
             let vocab_size = self.config.vocab_size;
             let block_size = self.cache.block_size();
@@ -125,22 +153,22 @@ mod cuda_impl {
                 return Err(LLMError::ModelError("empty input".into()));
             }
 
-            debug!(num_tokens, "GpuModelRunner::forward");
+            debug!(num_tokens, num_seqs, is_prefill, "GpuModelRunner::forward");
 
-            // Upload positions to GPU (reused across all layers)
+            // Upload positions to GPU
             let positions_gpu: CudaSlice<u32> = self.device
                 .htod_sync_copy(positions)
                 .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
 
             // Upload context_lens to GPU
             let context_lens_gpu: CudaSlice<u32> = self.device
-                .htod_sync_copy(context_lens)
+                .htod_sync_copy(&attn_meta.context_lens)
                 .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
 
             // Flatten block_tables to [num_seqs, max_blocks_per_seq] row-major
-            let max_blocks = block_tables.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let max_blocks = attn_meta.block_tables.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
             let mut flat_bt = vec![0u32; num_seqs * max_blocks];
-            for (s, row) in block_tables.iter().enumerate() {
+            for (s, row) in attn_meta.block_tables.iter().enumerate() {
                 for (b, &blk) in row.iter().enumerate() {
                     flat_bt[s * max_blocks + b] = blk;
                 }
@@ -149,20 +177,25 @@ mod cuda_impl {
                 .htod_sync_copy(&flat_bt)
                 .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
 
-            // Zero slot_mapping -- cache writes not yet wired, only decode path used
+            // Upload real slot_mapping
             let slot_mapping_gpu: CudaSlice<u32> = self.device
-                .alloc_zeros(num_tokens)
-                .map_err(|e| LLMError::GpuError(format!("slot_mapping alloc: {e}")))?;
+                .htod_sync_copy(&attn_meta.slot_mapping)
+                .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
 
-            let max_context_len = context_lens.iter().copied().max().unwrap_or(0);
+            let max_context_len = attn_meta.max_context_len;
 
             // Step 1: token embedding lookup
+            info!("gpu_runner: embedding lookup");
             let mut hidden_states = self.embedding_lookup(token_ids)?;
+            info!("gpu_runner: embedding done");
 
             // Step 2: transformer layers
             let gpu_cache = self.cache.gpu_cache();
+            let num_layers = self.layers.len();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                trace!(layer = layer_idx, "gpu transformer layer");
+                if layer_idx == 0 || layer_idx == num_layers - 1 {
+                    info!(layer = layer_idx, "gpu_runner: layer start");
+                }
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let weights = self.layer_weights(layer_idx)?;
                 let input = GpuLayerInput {
@@ -177,8 +210,14 @@ mod cuda_impl {
                     num_seqs,
                     max_context_len,
                     block_size,
+                    is_prefill,
+                    rope_cos: &self.rope_cos,
+                    rope_sin: &self.rope_sin,
                 };
                 hidden_states = layer.forward(&input, &weights, &self.blas)?;
+                if layer_idx == 0 || layer_idx == num_layers - 1 {
+                    info!(layer = layer_idx, "gpu_runner: layer done");
+                }
             }
 
             // Step 3: final RMSNorm
@@ -292,8 +331,8 @@ mod mock_impl {
             &self,
             _token_ids: &[u32],
             _positions: &[u32],
-            _block_tables: &[Vec<u32>],
-            _context_lens: &[u32],
+            _attn_meta: &crate::bridge::AttentionMetadata,
+            _is_prefill: bool,
         ) -> Result<Vec<f32>> {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),

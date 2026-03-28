@@ -109,6 +109,48 @@ impl CublasHandle {
         Ok(())
     }
 
+    /// SGEMM (no transpose): C[m,n] = A[m,k] @ B[k,n]
+    ///
+    /// Both A and B are row-major. No transpose on either operand.
+    /// Used for attention: probs[tokens, kv_len] @ V[kv_len, head_dim].
+    pub fn sgemm_nn(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        beta: f32,
+        c: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        // Row-major C[m,n] = A[m,k] @ B[k,n]
+        // cuBLAS col-major: C_col[n,m] = B_col[n,k] @ A_col[k,m]
+        // B row[k,n] = col[n,k], OP_N -> [n,k]. lda=n.
+        // A row[m,k] = col[k,m], OP_N -> [k,m]. ldb=k.
+        // C_col[n,m], ldc=n.
+        unsafe {
+            self.blas
+                .gemm(
+                    GemmConfig {
+                        transa: cublasOperation_t::CUBLAS_OP_N,
+                        transb: cublasOperation_t::CUBLAS_OP_N,
+                        m: n as i32,
+                        n: m as i32,
+                        k: k as i32,
+                        alpha,
+                        lda: n as i32,
+                        ldb: k as i32,
+                        beta,
+                        ldc: n as i32,
+                    },
+                    b, a, c,
+                )
+                .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemm_nn failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Batched SGEMM for multiple independent matrix multiplications (e.g. multi-head attention).
     ///
     /// Each triple (a_batch[i], b_batch[i], c_batch[i]) is an independent GEMM with
