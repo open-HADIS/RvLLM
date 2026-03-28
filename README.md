@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 15 CUDA kernels. 3,946 tok/s on B200. 3,191 tok/s on A100. 16x faster than Python vLLM. Zero errors across 14,620 verified requests.**
+**23 Rust crates. 15 CUDA kernels. 8,339 tok/s on A100 (FP16). Matches Python vLLM at production batch sizes. Zero errors across 14,620 verified requests.**
 
 ## Install
 
@@ -20,7 +20,29 @@ Or build from source -- see [Quick Start](#quick-start) below.
 
 All measurements verified with coherent text output at every batch size. Zero errors across thousands of requests. See `bench/run.sh` to reproduce.
 
-### B200 (180GB VRAM, $3.13/hr on vast.ai)
+### Head-to-head: rvLLM vs Python vLLM on A100 80GB SXM4
+
+Same hardware, same model (Qwen2.5-1.5B), greedy decoding, 32 tokens/request. rvLLM FP16 with tensor cores vs Python vLLM 0.18.
+
+| Concurrent (N) | rvLLM (tok/s) | vLLM 0.18 (tok/s) | Notes |
+|---:|---:|---:|---|
+| 1 | 58 | 69 | Single-request latency |
+| 4 | 283 | 256 | rvLLM ahead |
+| 8 | 467 | 517 | |
+| 16 | 725 | 1,060 | |
+| 32 | 891 | 1,943 | |
+| 48 | 3,436 | 2,887 | **rvLLM pulls ahead** |
+| 64 | 3,938 | 3,828 | Matched |
+| 96 | 5,094 | 5,197 | Matched |
+| 128 | 6,301 | 6,400 | Matched |
+| 256 | 8,055 | 9,437 | |
+| 512 | 8,308 | 10,771 | |
+| **768** | **8,339** | -- | **rvLLM peak** |
+| 1,024 | 8,308 | 12,740 | |
+
+rvLLM matches Python vLLM throughput at production batch sizes (N=48-128) and peaks at **8,339 tok/s** (FP16, tensor cores, f16 KV cache). vLLM scales further at very high concurrency due to its mature CUDA graph and continuous batching optimizations.
+
+### B200 (180GB VRAM, FP32 -- earlier results)
 
 | Concurrent (N) | Tokens | Wall time | tok/s | Errors |
 |---:|---:|---:|---:|---:|
@@ -40,25 +62,7 @@ All measurements verified with coherent text output at every batch size. Zero er
 | 3,072 | 98,304 | 25,000ms | 3,932 | 0 |
 | **4,096** | **131,072** | **34,002ms** | **3,854** | **0** |
 
-Peak: **3,946 tok/s** at N=768. Sustained ~3,900 tok/s from N=512 to N=4,096. Zero errors across 13,553 total requests.
-
-### A100 SXM4 40GB ($0.60/hr on vast.ai)
-
-| Concurrent (N) | Tokens | Wall time | tok/s | vs Python vLLM | Errors |
-|---:|---:|---:|---:|---|---:|
-| 1 | 32 | 731ms | 43 | 0.2x | 0 |
-| 4 | 128 | 561ms | 228 | 1.1x | 0 |
-| 8 | 256 | 681ms | 375 | 1.9x | 0 |
-| 16 | 512 | 901ms | 568 | 2.8x | 0 |
-| 32 | 1,024 | 1,286ms | 796 | 4x | 0 |
-| 48 | 1,536 | 752ms | 2,042 | 10.2x | 0 |
-| 64 | 2,048 | 824ms | 2,485 | 12.4x | 0 |
-| 96 | 3,072 | 1,181ms | 2,601 | 13x | 0 |
-| 128 | 4,096 | 1,368ms | 2,994 | 15x | 0 |
-| 256 | 8,192 | 2,570ms | 3,187 | 15.9x | 0 |
-| **512** | **16,384** | **5,134ms** | **3,191** | **16x** | **0** |
-
-Peak: **3,191 tok/s** at N=512 (16x Python vLLM 0.18). Zero errors across 1,067 requests.
+Peak: **3,946 tok/s** at N=768 (FP32). These B200 results predate the FP16 work and are superseded by the A100 FP16 head-to-head above. Zero errors across 13,553 total requests.
 
 Coherence verified on 5 diverse prompts (relativity, quantum computing, geography, Python code, ML):
 ```
@@ -69,15 +73,14 @@ Prompt: "Explain quantum computing..."   -> "Quantum computing is a new type of 
 
 ### Summary
 
-| Metric | rvLLM (B200) | rvLLM (A100) | Python vLLM | Comparison |
-|---|---:|---:|---:|---|
-| Peak throughput | 3,946 tok/s | 3,191 tok/s | 200 tok/s | **16-20x faster** |
-| Max verified batch | N=4,096 | N=512 | -- | -- |
-| Total requests verified | 13,553 | 1,067 | -- | **0 errors** |
-| Startup time | 9 sec | 6 sec | 121 sec | **15-20x faster** |
-| Binary / install size | 16 MB | 16 MB | ~500 MB | **31x smaller** |
-| CPU memory (RSS) | -- | 348 MB | 1,033 MB | **3x less** |
-| Output quality | Coherent | Coherent | Coherent | -- |
+| Metric | rvLLM | Python vLLM 0.18 | Comparison |
+|---|---:|---:|---|
+| Peak throughput (A100, FP16) | 8,339 tok/s | 12,740 tok/s | Matches at N=48-128 |
+| Peak throughput (B200, FP32) | 3,946 tok/s | -- | Earlier result |
+| Startup time | 6 sec | 121 sec | **20x faster** |
+| Binary / install size | 16 MB | ~500 MB | **31x smaller** |
+| CPU memory (RSS) | 348 MB | 1,033 MB | **3x less** |
+| Total requests verified | 14,620 | -- | **0 errors** |
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
@@ -128,7 +131,7 @@ Python vLLM requires PyTorch (~2GB), transformers, numpy, and dozens of other pa
 
 ### Direct GPU access
 
-Python vLLM talks to the GPU through PyTorch, which adds overhead for tensor creation, memory management, and kernel dispatch. rvLLM calls cuBLAS and CUDA kernels directly through cudarc, eliminating the middle layer.
+Python vLLM talks to the GPU through PyTorch, which adds overhead for tensor creation, memory management, and kernel dispatch. rvLLM calls cuBLAS and CUDA kernels directly through cudarc, eliminating the middle layer. FP16 hgemm with tensor cores for matrix multiplies and f16 KV cache keep memory bandwidth and compute on the fast path.
 
 ### Startup time
 
@@ -546,8 +549,8 @@ rvLLM benchmark --model <MODEL>   Run offline throughput benchmark
 ## Project Status
 
 ### Working
-- GPU inference on A100 via cuBLAS SGEMM + CUDA kernels (RMSNorm, SiLU, residual, embedding on GPU)
-- RoPE + KV cache for coherent text generation
+- GPU inference on A100 via cuBLAS HGEMM (FP16, tensor cores) + CUDA kernels (RMSNorm, SiLU, residual, embedding on GPU)
+- RoPE + f16 KV cache for coherent text generation
 - Continuous batching scheduler with preemption
 - Full sampling pipeline (temperature, top-k/p/min-p, penalties, multinomial, Rayon parallel)
 - Guided decoding / JSON mode / JSON schema / regex grammar
@@ -599,7 +602,7 @@ Heavy use of Claude Code with Claude Opus for architecture design, CUDA kernel w
 
 ### Total
 
-Roughly **$1,780** in compute and AI overage costs to go from zero to 3,946 tok/s (16-20x Python vLLM). No salaries, no team -- one developer with Claude and rented GPUs.
+Roughly **$1,780** in compute and AI overage costs to go from zero to 8,339 tok/s (matching Python vLLM at production batch sizes). No salaries, no team -- one developer (Andy Norris, San Francisco) with Claude and rented GPUs over 22 hours.
 
 ## Changelog
 

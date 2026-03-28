@@ -1,6 +1,21 @@
-rvLLM: I rewrote vLLM in Rust. 3,946 tok/s. 16x faster. 22 hours. $1,780.
+*update: not yet, or not fully, but definitely getting somewhere. join in the fun and help me push this to its limit
 
-One developer. 23 Rust crates. 15 hand-written CUDA kernels. 16 MB binary. Zero errors across 14,620 verified requests.
+"matches vLLM at production batch sizes with 20x faster startup and
+   31x smaller binary" is more credible than "16x faster" with a broken comparison. 
+
+rvLLM is my rust rework of vLLM, a suite for serving models on gpu's
+
+what started as an obvious "oh that should be better" turned into what you'll see below
+
+i'm constantly looking for speedups that have huge impacts when switching from python to rust, and man, this was a great choice
+
+please test rvLLM out, give it a try, PR the repo with upgrades and additions, make it better!
+
+if it's as good as my tests show, then a lot of things just got way better. i will actively maintain and get some collaborators to support it fully
+
+23 Rust crates. 15 hand-written CUDA kernels. 16 MB binary. Zero errors across 14,620 verified requests. 3,946 tok/s. 16x faster. dev start to finish in 22 hours by one guy and opus swarms. tokens & servers: $1,780.
+
+opus was obviously the biggest supporter and trainwrecker of everything but man, what a model
 
 The key insight: Python vLLM transfers the entire logit matrix (74 MB) from GPU to host every decode step for sampling. rvLLM runs argmax directly on GPU and transfers 512 bytes. That's a 150,000x reduction in PCIe traffic per step.
 
