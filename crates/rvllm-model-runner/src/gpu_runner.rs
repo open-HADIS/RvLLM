@@ -187,9 +187,16 @@ mod cuda_impl {
 
             let max_context_len = attn_meta.max_context_len;
 
-            // Metadata dump (first call only)
-            static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            let probe = !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
+            // Metadata dump (first 5 calls)
+            static CALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let probe = call_num < 15;
+            if probe {
+                eprintln!("STEP {} prefill={} toks={:?} pos={:?} slots={:?} ctx={:?} maxctx={}",
+                    call_num, is_prefill, token_ids, positions,
+                    &attn_meta.slot_mapping[..8.min(attn_meta.slot_mapping.len())],
+                    &attn_meta.context_lens, max_context_len);
+            }
 
             // Decode-specific probe (first decode call only)
             static DECODE_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

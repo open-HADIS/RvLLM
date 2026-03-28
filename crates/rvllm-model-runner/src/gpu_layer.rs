@@ -195,15 +195,13 @@ mod inner {
                 .map_err(|e| LLMError::GpuError(format!("post-cache-write sync: {e}")))?;
 
             let attn_out = if input.is_prefill {
-                // Prefill: read from paged cache (K/V already written above)
-                info!(layer = cfg.layer_idx, "gpu_layer: prefill_attention start");
-                Self::prefill_attention(
-                    &self.device, &q_rot,
-                    input.key_cache, input.value_cache,
-                    input.block_tables, input.context_lens,
-                    num_tokens, input.num_seqs,
-                    num_heads, num_kv_heads, head_dim,
-                    input.max_context_len, input.block_size,
+                // Prefill: use naive cuBLAS attention (Q@K^T -> softmax -> @V)
+                // FA2 prefill kernel has a multi-token bug; bypass it.
+                info!(layer = cfg.layer_idx, "gpu_layer: naive_prefill_attention start");
+                Self::naive_prefill_attention(
+                    &self.device, blas,
+                    &q_rot, &k_rot, &v,
+                    num_tokens, num_heads, num_kv_heads, head_dim,
                 )?
             } else {
                 // Decode: read from paged cache
@@ -478,6 +476,115 @@ mod inner {
 
         /// Prefill attention: write K/V to cache, then launch flash_attention_2_kernel
         /// reading from the paged cache with real block_tables.
+        /// Naive prefill attention: per-head Q@K^T -> softmax -> @V via cuBLAS.
+        /// Bypasses FA2 kernel for correctness. Used only during prefill (once per request).
+        fn naive_prefill_attention(
+            device: &Arc<CudaDevice>,
+            blas: &CublasHandle,
+            q: &CudaSlice<f32>,      // [num_tokens, num_heads * head_dim]
+            k: &CudaSlice<f32>,      // [num_tokens, num_kv_heads * head_dim]
+            v: &CudaSlice<f32>,      // [num_tokens, num_kv_heads * head_dim]
+            num_tokens: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<CudaSlice<f32>> {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let heads_per_kv = num_heads / num_kv_heads;
+            let q_stride = num_heads * head_dim;
+
+            // Output: [num_tokens, num_heads * head_dim]
+            let mut output = device.alloc_zeros::<f32>(num_tokens * q_stride)
+                .map_err(|e| LLMError::GpuError(format!("naive attn output alloc: {e}")))?;
+
+            // Per-head attention via cuBLAS
+            for h in 0..num_heads {
+                let kv_h = h / heads_per_kv;
+
+                // Extract Q_head [num_tokens, head_dim] from Q [num_tokens, num_heads * head_dim]
+                // Extract K_head [num_tokens, head_dim] from K [num_tokens, num_kv_heads * head_dim]
+                // Extract V_head [num_tokens, head_dim] from V [num_tokens, num_kv_heads * head_dim]
+                // Use CPU gather for correctness (not perf-critical for prefill)
+                let q_all: Vec<f32> = device.dtoh_sync_copy(q)
+                    .map_err(|e| LLMError::GpuError(format!("naive attn q DtoH: {e}")))?;
+                let k_all: Vec<f32> = device.dtoh_sync_copy(k)
+                    .map_err(|e| LLMError::GpuError(format!("naive attn k DtoH: {e}")))?;
+                let v_all: Vec<f32> = device.dtoh_sync_copy(v)
+                    .map_err(|e| LLMError::GpuError(format!("naive attn v DtoH: {e}")))?;
+
+                let kv_stride = num_kv_heads * head_dim;
+                let mut qh = vec![0.0f32; num_tokens * head_dim];
+                let mut kh = vec![0.0f32; num_tokens * head_dim];
+                let mut vh = vec![0.0f32; num_tokens * head_dim];
+
+                for t in 0..num_tokens {
+                    for d in 0..head_dim {
+                        qh[t * head_dim + d] = q_all[t * q_stride + h * head_dim + d];
+                        kh[t * head_dim + d] = k_all[t * kv_stride + kv_h * head_dim + d];
+                        vh[t * head_dim + d] = v_all[t * kv_stride + kv_h * head_dim + d];
+                    }
+                }
+
+                // scores[i][j] = sum_d qh[i][d] * kh[j][d] * scale (with causal mask)
+                let mut scores = vec![0.0f32; num_tokens * num_tokens];
+                for qi in 0..num_tokens {
+                    for ki in 0..num_tokens {
+                        if ki > qi {
+                            scores[qi * num_tokens + ki] = f32::NEG_INFINITY;
+                        } else {
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += qh[qi * head_dim + d] * kh[ki * head_dim + d];
+                            }
+                            scores[qi * num_tokens + ki] = dot * scale;
+                        }
+                    }
+                }
+
+                // Softmax per row
+                for qi in 0..num_tokens {
+                    let row = &mut scores[qi * num_tokens..(qi + 1) * num_tokens];
+                    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for v in row.iter_mut() {
+                        *v = (*v - max).exp();
+                        sum += *v;
+                    }
+                    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                    for v in row.iter_mut() {
+                        *v *= inv;
+                    }
+                }
+
+                // out_head = scores @ vh
+                let mut out_head = vec![0.0f32; num_tokens * head_dim];
+                for qi in 0..num_tokens {
+                    for d in 0..head_dim {
+                        let mut acc = 0.0f32;
+                        for ki in 0..num_tokens {
+                            acc += scores[qi * num_tokens + ki] * vh[ki * head_dim + d];
+                        }
+                        out_head[qi * head_dim + d] = acc;
+                    }
+                }
+
+                // Scatter back into output
+                let mut out_all: Vec<f32> = device.dtoh_sync_copy(&output)
+                    .map_err(|e| LLMError::GpuError(format!("naive attn out DtoH: {e}")))?;
+                for t in 0..num_tokens {
+                    for d in 0..head_dim {
+                        out_all[t * q_stride + h * head_dim + d] = out_head[t * head_dim + d];
+                    }
+                }
+                output = device.htod_sync_copy(&out_all)
+                    .map_err(|e| LLMError::GpuError(format!("naive attn out HtoD: {e}")))?;
+            }
+
+            Ok(output)
+        }
+
+        /// FA2 prefill attention (currently buggy for multi-token, kept for reference).
+        #[allow(dead_code)]
         fn prefill_attention(
             device: &Arc<CudaDevice>,
             q: &CudaSlice<f32>,
