@@ -50,9 +50,6 @@ mod cuda_impl {
         config: ModelRunnerConfig,
         device: Arc<CudaContext>,
         stream: Arc<CudaStream>,
-        /// Separate stream for async HtoD metadata uploads, overlaps with
-        /// the previous step's compute still running on `stream`.
-        copy_stream: Arc<CudaStream>,
         layers: Vec<GpuTransformerLayer>,
         embed_tokens: CudaSlice<f32>,
         final_norm_weight: CudaSlice<f32>,
@@ -141,14 +138,6 @@ mod cuda_impl {
                 .map_err(|e| LLMError::GpuError(format!("rope sin HtoD: {e}")))?;
             info!(max_pos, half_dim, "RoPE tables uploaded to GPU");
 
-            // Create a dedicated copy stream for async HtoD metadata uploads.
-            // This stream runs concurrently with compute on `stream`, letting
-            // metadata transfers overlap with the previous step's GPU work.
-            let copy_stream = device
-                .new_stream()
-                .map_err(|e| LLMError::GpuError(format!("copy_stream create: {e}")))?;
-            info!("copy_stream created for async metadata uploads");
-
             Ok(Self {
                 weights,
                 cache,
@@ -157,7 +146,6 @@ mod cuda_impl {
                 config,
                 device,
                 stream,
-                copy_stream,
                 layers,
                 embed_tokens,
                 final_norm_weight,
@@ -204,13 +192,6 @@ mod cuda_impl {
             }
 
             debug!(num_tokens, num_seqs, is_prefill, greedy_only, "GpuModelRunner::forward_ex");
-
-            // ---- Async metadata upload on copy_stream ----
-            // All HtoD transfers below run on copy_stream, which executes
-            // concurrently with any leftover compute from the previous step
-            // still running on the main stream. The main stream will wait
-            // for copy_stream before the embedding lookup that first needs
-            // this data.
 
             // Upload positions to GPU as i32 (CUDA kernels expect int*)
             let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
@@ -267,13 +248,6 @@ mod cuda_impl {
                 .stream
                 .clone_htod(&seq_starts_host)
                 .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
-
-            // ---- Sync point: main stream waits for copy_stream ----
-            // Ensure all metadata is resident on GPU before embedding lookup
-            // and subsequent layer compute that reads these buffers.
-            self.stream
-                .join(&self.stream)
-                .map_err(|e| LLMError::GpuError(format!("stream join copy_stream: {e}")))?;
 
             // Step 1: token embedding lookup
             info!("gpu_runner: embedding lookup");

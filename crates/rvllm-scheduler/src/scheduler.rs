@@ -122,11 +122,6 @@ pub struct Scheduler {
     waiting: VecDeque<SequenceGroup>,
     running: Vec<SequenceGroup>,
     swapped: VecDeque<SequenceGroup>,
-    /// Cached per-group token counts (index-parallel with `running`).
-    /// Recomputed only when `running_dirty` is true.
-    cached_tokens: Vec<usize>,
-    /// True when the running set changed since last sort/token-count cache.
-    running_dirty: bool,
 }
 
 impl Scheduler {
@@ -144,8 +139,6 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: Vec::new(),
             swapped: VecDeque::new(),
-            cached_tokens: Vec::new(),
-            running_dirty: true,
         }
     }
 
@@ -171,9 +164,6 @@ impl Scheduler {
         });
         for group in &removed_running {
             self.free_group(group);
-        }
-        if !removed_running.is_empty() {
-            self.running_dirty = true;
         }
         // Remove from swapped.
         self.swapped.retain(|g| &g.request_id != request_id);
@@ -206,7 +196,7 @@ impl Scheduler {
     /// 2. If memory pressure, preempt lowest-priority running groups.
     /// 3. Try to swap in previously swapped groups.
     /// 4. Try to admit new requests from the waiting queue.
-    /// 5. Build the batch: decode-first, then interleave prefill chunks.
+    /// 5. Build the batch respecting budget constraints.
     /// 6. Collect block operations.
     pub fn schedule(&mut self) -> Result<SchedulerOutputs> {
         let mut blocks_to_swap_in: Vec<(BlockId, BlockId)> = Vec::new();
@@ -226,120 +216,46 @@ impl Scheduler {
         // -- Step 4: admit from waiting queue --
         self.admit_waiting()?;
 
-        // -- Step 5: build output batch with decode-first interleaving --
-        // Only re-sort and recompute token counts when running set changed.
-        if self.running_dirty {
-            self.config.policy.sort(&mut self.running);
-            self.cached_tokens.clear();
-            self.cached_tokens.reserve(self.running.len());
-            for group in &self.running {
-                self.cached_tokens.push(Self::tokens_for_group_static(
-                    group,
-                    self.config.max_prefill_chunk,
-                ));
-            }
-            self.running_dirty = false;
-        }
-
-        let max_seqs = self.config.max_num_seqs;
-        let max_tokens = self.config.max_num_batched_tokens;
-
-        // Pre-size output vec.
-        let mut scheduled: Vec<ScheduledSequenceGroup> =
-            Vec::with_capacity(self.running.len().min(max_seqs));
+        // -- Step 5: build output batch --
+        let mut scheduled: Vec<ScheduledSequenceGroup> = Vec::new();
         let mut num_batched_tokens: usize = 0;
         let mut num_prefill_groups: usize = 0;
 
-        // Bitmap tracking which indices are selected into the batch.
-        let n = self.running.len();
-        let mut selected = vec![false; n];
+        // Sort running groups by policy before selecting.
+        let mut candidates: Vec<SequenceGroup> = std::mem::take(&mut self.running);
+        self.config.policy.sort(&mut candidates);
 
-        // Pass 1: schedule all decode groups first (1 token each, cheap).
-        // This keeps decode latency low and packs the batch efficiently.
-        for i in 0..n {
-            if scheduled.len() >= max_seqs {
-                break;
-            }
-            let tokens_i = self.cached_tokens[i];
-            // Decode group: not prefilling (remaining_prefill == 0).
-            if self.running[i].is_prefilling() {
-                continue;
-            }
-            if num_batched_tokens + tokens_i > max_tokens {
-                continue;
-            }
-            num_batched_tokens += tokens_i;
-            selected[i] = true;
-            scheduled.push(ScheduledSequenceGroup {
-                seq_group: self.running[i].clone(),
-                token_chunk_size: tokens_i,
-            });
-        }
+        let mut kept_running = Vec::new();
 
-        // Pass 2: fill remaining budget with prefill chunks, interleaved.
-        for i in 0..n {
-            if scheduled.len() >= max_seqs {
-                break;
-            }
-            if selected[i] {
+        for mut group in candidates {
+            if scheduled.len() >= self.config.max_num_seqs {
+                kept_running.push(group);
                 continue;
             }
-            let mut tokens_i = self.cached_tokens[i];
-            if !self.running[i].is_prefilling() {
-                // Decode that didn't fit in pass 1 due to token budget.
-                if num_batched_tokens + tokens_i > max_tokens {
-                    continue;
-                }
-                num_batched_tokens += tokens_i;
-                selected[i] = true;
-                scheduled.push(ScheduledSequenceGroup {
-                    seq_group: self.running[i].clone(),
-                    token_chunk_size: tokens_i,
-                });
-                continue;
-            }
-            // Prefill: chunk to fit remaining token budget.
-            let remaining_budget = max_tokens.saturating_sub(num_batched_tokens);
-            if remaining_budget == 0 {
-                break;
-            }
-            tokens_i = tokens_i.min(remaining_budget);
-            if tokens_i == 0 {
-                continue;
-            }
-            num_batched_tokens += tokens_i;
-            num_prefill_groups += 1;
-            selected[i] = true;
 
-            let mut group = self.running[i].clone();
-            group.num_prompt_tokens_processed += tokens_i;
+            let tokens_this_group = self.tokens_for_group(&group);
+            if num_batched_tokens + tokens_this_group > self.config.max_num_batched_tokens {
+                kept_running.push(group);
+                continue;
+            }
+
+            let is_prefill = group.is_prefilling();
+            if is_prefill {
+                group.num_prompt_tokens_processed += tokens_this_group;
+                num_prefill_groups += 1;
+            }
+
+            num_batched_tokens += tokens_this_group;
             scheduled.push(ScheduledSequenceGroup {
                 seq_group: group,
-                token_chunk_size: tokens_i,
+                token_chunk_size: tokens_this_group,
             });
         }
 
-        // Update running list: replace scheduled groups with their updated state
-        // and keep unselected groups as-is.
-        {
-            let mut sched_idx = 0;
-            for i in 0..n {
-                if selected[i] {
-                    // Find the matching scheduled entry (they appear in order).
-                    while sched_idx < scheduled.len() {
-                        if scheduled[sched_idx].seq_group.request_id == self.running[i].request_id {
-                            self.running[i] = scheduled[sched_idx].seq_group.clone();
-                            sched_idx += 1;
-                            break;
-                        }
-                        sched_idx += 1;
-                    }
-                }
-            }
-            // Invalidate cached tokens since prefill progress changed.
-            if num_prefill_groups > 0 {
-                self.running_dirty = true;
-            }
+        self.running = kept_running;
+        // Put scheduled groups back into running for next iteration.
+        for sg in &scheduled {
+            self.running.push(sg.seq_group.clone());
         }
 
         // -- Step 6: collect CoW block copies --
@@ -373,56 +289,43 @@ impl Scheduler {
     // -----------------------------------------------------------------------
 
     /// Determine how many tokens to process for a group this step.
-    /// Static version avoids borrowing self, used for pre-computing token counts.
-    #[inline(always)]
-    fn tokens_for_group_static(group: &SequenceGroup, max_prefill_chunk: usize) -> usize {
+    fn tokens_for_group(&self, group: &SequenceGroup) -> usize {
         let remaining = group.remaining_prefill();
         if remaining > 0 {
-            if max_prefill_chunk > 0 {
-                remaining.min(max_prefill_chunk)
+            // Chunked prefill: limit chunk size if configured.
+            if self.config.max_prefill_chunk > 0 {
+                remaining.min(self.config.max_prefill_chunk)
             } else {
                 remaining
             }
         } else {
+            // Decode phase: 1 token per active sequence.
             group.num_active()
         }
     }
 
-    /// Determine how many tokens to process for a group this step.
-    fn tokens_for_group(&self, group: &SequenceGroup) -> usize {
-        Self::tokens_for_group_static(group, self.config.max_prefill_chunk)
-    }
-
     /// Remove fully finished groups from running and free their blocks.
     fn retire_finished(&mut self) {
-        let before = self.running.len();
-        let bm = &mut self.block_manager;
-        self.running.retain(|group| {
+        let mut still_running = Vec::with_capacity(self.running.len());
+        for group in std::mem::take(&mut self.running) {
             if group.is_finished() {
                 tracing::debug!(request_id = %group.request_id, "retiring finished group");
-                for seq in &group.sequences {
-                    bm.free(seq);
-                }
-                false
+                self.free_group(&group);
             } else {
-                true
+                still_running.push(group);
             }
-        });
-        if self.running.len() != before {
-            self.running_dirty = true;
         }
+        self.running = still_running;
     }
 
     /// If there isn't enough GPU memory for all running sequences, preempt
     /// the lowest-priority ones until memory is sufficient.
     fn preempt_if_needed(&mut self) -> Result<Vec<(BlockId, BlockId)>> {
         let mut swap_pairs = Vec::new();
-        let mut did_preempt = false;
 
         while !self.running.is_empty() && !self.block_manager.above_watermark() {
             // Preempt the last (lowest-priority after sort) running group.
             let victim = self.running.pop().unwrap();
-            did_preempt = true;
             tracing::debug!(
                 request_id = %victim.request_id,
                 mode = ?self.config.preemption_mode,
@@ -438,6 +341,7 @@ impl Scheduler {
                     self.swapped.push_back(swapped);
                 }
                 PreemptionMode::Recompute => {
+                    // Free blocks, reset prefill progress, put back in waiting.
                     self.free_group(&victim);
                     let mut requeued = victim;
                     requeued.num_prompt_tokens_processed = 0;
@@ -447,22 +351,13 @@ impl Scheduler {
             }
         }
 
-        if did_preempt {
-            self.running_dirty = true;
-        }
-
         Ok(swap_pairs)
     }
 
     /// Try to swap in groups from the swapped queue while memory allows.
     fn try_swap_in(&mut self) -> Result<Vec<(BlockId, BlockId)>> {
-        if self.swapped.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut swap_pairs = Vec::new();
-        let mut still_swapped = VecDeque::with_capacity(self.swapped.len());
-        let mut swapped_any = false;
+        let mut still_swapped = VecDeque::new();
 
         while let Some(group) = self.swapped.pop_front() {
             if self.running.len() >= self.config.max_num_seqs {
@@ -470,7 +365,9 @@ impl Scheduler {
                 continue;
             }
 
+            // Check if we can swap in all sequences of the group.
             let can_swap = group.sequences.iter().all(|seq| {
+                // For swap-in we need enough free GPU blocks.
                 self.block_manager.can_allocate(seq)
             });
 
@@ -479,11 +376,11 @@ impl Scheduler {
                 swap_pairs.extend(pairs);
                 let mut resumed = group;
                 resumed.set_status(SequenceStatus::Running);
-                tracing::debug!(request_id = %resumed.request_id, "swapped in group");
                 self.running.push(resumed);
-                swapped_any = true;
+                tracing::debug!(request_id = %self.running.last().unwrap().request_id, "swapped in group");
             } else {
                 still_swapped.push_back(group);
+                // If we can't swap in the first group, stop trying.
                 break;
             }
         }
@@ -494,26 +391,17 @@ impl Scheduler {
         }
         self.swapped = still_swapped;
 
-        if swapped_any {
-            self.running_dirty = true;
-        }
-
         Ok(swap_pairs)
     }
 
     /// Admit requests from the waiting queue while budget allows.
     fn admit_waiting(&mut self) -> Result<()> {
-        if self.waiting.is_empty() {
-            return Ok(());
-        }
-
-        let mut still_waiting = VecDeque::with_capacity(self.waiting.len());
+        let mut still_waiting = VecDeque::new();
 
         // Sort waiting by policy.
         let mut waiting_vec: Vec<SequenceGroup> = self.waiting.drain(..).collect();
         self.config.policy.sort(&mut waiting_vec);
 
-        let mut admitted_any = false;
         for mut group in waiting_vec {
             if self.running.len() >= self.config.max_num_seqs {
                 still_waiting.push_back(group);
@@ -527,25 +415,22 @@ impl Scheduler {
                 .all(|seq| self.block_manager.can_allocate(seq));
 
             if can_alloc {
+                // Allocate blocks for each sequence.
                 for seq in &group.sequences {
                     self.block_manager.allocate(seq)?;
                 }
                 group.set_status(SequenceStatus::Running);
+                self.running.push(group);
                 tracing::debug!(
-                    request_id = %group.request_id,
+                    request_id = %self.running.last().unwrap().request_id,
                     "admitted from waiting"
                 );
-                self.running.push(group);
-                admitted_any = true;
             } else {
                 still_waiting.push_back(group);
             }
         }
 
         self.waiting = still_waiting;
-        if admitted_any {
-            self.running_dirty = true;
-        }
         Ok(())
     }
 
