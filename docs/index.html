@@ -3,601 +3,337 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>rvLLM: A High-Performance LLM Inference Engine in Rust</title>
+<title>rvLLM -- High-Performance LLM Inference in Rust</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+html{font-size:15px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{background:#000;color:#d4d4d4;font-family:Helvetica Neue,Helvetica,Arial,sans-serif;font-weight:300;line-height:1.65;letter-spacing:-0.01em}
+a{color:#d4d4d4;text-decoration:none}
+a:hover{color:#fff}
+::selection{background:#333;color:#fff}
 
-:root {
-  --bg: #ffffff;
-  --fg: #1a1a1a;
-  --fg-secondary: #555555;
-  --rule-color: #222222;
-  --rule-color-light: #cccccc;
-  --code-bg: #f5f5f5;
-  --code-border: #e0e0e0;
-  --code-fg: #1a1a1a;
-  --table-header-bg: #f0f0f0;
-  --table-header-fg: #1a1a1a;
-  --table-stripe: #fafafa;
-  --link-color: #1a1a1a;
-  --toggle-bg: #e0e0e0;
-  --toggle-knob: #666666;
-  --abstract-bg: #f8f8f8;
-  --abstract-border: #999;
-  --highlight-bg: #f5f5f5;
-  --highlight-border: #ccc;
-}
+.container{max-width:740px;margin:0 auto;padding:0 2rem}
 
-:root.color {
-  --bg: #ffffff;
-  --fg: #1a1a1a;
-  --fg-secondary: #444444;
-  --rule-color: #222222;
-  --rule-color-light: #d0d7de;
-  --code-bg: #f6f8fa;
-  --code-border: #d0d7de;
-  --code-fg: #1a1a1a;
-  --table-header-bg: #2c3e6b;
-  --table-header-fg: #ffffff;
-  --table-stripe: #f0f4f8;
-  --link-color: #2563eb;
-  --toggle-bg: #bfdbfe;
-  --toggle-knob: #2563eb;
-  --abstract-bg: #f0f4f8;
-  --abstract-border: #3b82f6;
-  --highlight-bg: #eff6ff;
-  --highlight-border: #3b82f6;
-}
+header{padding:5rem 0 3rem}
+header h1{font-size:2.6rem;font-weight:700;letter-spacing:-0.04em;color:#fff;margin-bottom:0.3rem}
+header .sub{font-size:1rem;color:#555;font-weight:300;margin-bottom:0.5rem}
+header .links{font-size:0.8rem;color:#444;letter-spacing:0.04em}
+header .links a{color:#666;margin-right:1.2rem}
+header .links a:hover{color:#fff}
 
-:root.dark {
-  --bg: #0d1117;
-  --fg: #e6edf3;
-  --fg-secondary: #8b949e;
-  --rule-color: #e6edf3;
-  --rule-color-light: #30363d;
-  --code-bg: #161b22;
-  --code-border: #30363d;
-  --code-fg: #e6edf3;
-  --table-header-bg: #161b22;
-  --table-header-fg: #e6edf3;
-  --table-stripe: #161b22;
-  --link-color: #58a6ff;
-  --toggle-bg: #30363d;
-  --toggle-knob: #58a6ff;
-  --abstract-bg: #161b22;
-  --abstract-border: #58a6ff;
-  --highlight-bg: #161b22;
-  --highlight-border: #58a6ff;
-}
+.hero{padding:2rem 0 3rem;border-bottom:1px solid #111}
+.hero .big{font-size:3.6rem;font-weight:700;color:#fff;letter-spacing:-0.04em;line-height:1.1}
+.hero .sub{font-size:0.95rem;color:#555;margin-top:0.4rem;font-weight:300}
 
-*, *::before, *::after { box-sizing: border-box; }
+section{padding:3rem 0;border-bottom:1px solid #111}
+section:last-of-type{border-bottom:none}
 
-body {
-  margin: 0; padding: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: 'Libre Baskerville', Georgia, 'Times New Roman', serif;
-  font-size: 16px;
-  line-height: 1.7;
-  transition: background 0.3s, color 0.3s;
-}
+h2{font-size:1.3rem;font-weight:600;letter-spacing:-0.03em;color:#fff;margin-bottom:0.3rem}
+.section-sub{color:#555;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:1.8rem;font-weight:400}
+h3{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:#555;font-weight:500;margin:2rem 0 0.8rem}
 
-.paper { max-width: 760px; margin: 0 auto; padding: 60px 24px 80px; }
+p{margin-bottom:0.9rem;font-size:0.92rem;color:#999}
+strong{font-weight:500;color:#ccc}
 
-/* Toggle */
-.toggle-wrap {
-  position: fixed; top: 16px; right: 16px; z-index: 1000;
-  display: flex; align-items: center; gap: 6px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
-  color: var(--fg-secondary); background: var(--bg);
-  padding: 6px 12px; border-radius: 20px; border: 1px solid var(--rule-color-light);
-  cursor: pointer; user-select: none;
-  transition: background 0.3s, border-color 0.3s, color 0.3s;
-}
-.toggle-wrap:hover { border-color: var(--fg-secondary); }
-.toggle-track {
-  width: 36px; height: 18px; background: var(--toggle-bg);
-  border-radius: 9px; position: relative; transition: background 0.3s;
-}
-.toggle-knob {
-  width: 14px; height: 14px; background: var(--toggle-knob);
-  border-radius: 50%; position: absolute; top: 2px; left: 2px;
-  transition: transform 0.3s, background 0.3s;
-}
-.theme-btn {
-  background: none; border: none; cursor: pointer;
-  font: inherit; color: var(--fg-secondary); padding: 2px 4px;
-  font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
-  opacity: 0.5; transition: opacity 0.2s;
-}
-.theme-btn.active { opacity: 1; font-weight: 700; }
-.theme-btn:hover { opacity: 0.8; }
+ul,ol{padding-left:1.4rem;margin-bottom:0.9rem}
+li{font-size:0.92rem;color:#999;margin-bottom:0.25rem}
 
-/* Title */
-.paper-title { font-size: 1.8em; font-weight: 700; text-align: center; margin: 0 0 8px; line-height: 1.3; }
-.paper-author { text-align: center; font-size: 1em; color: var(--fg-secondary); margin: 0 0 4px; }
-.paper-links { text-align: center; font-size: 0.85em; margin: 0 0 4px; }
-.paper-links a { color: var(--link-color); text-decoration: none; margin: 0 8px; }
-.paper-links a:hover { text-decoration: underline; }
-.paper-date { text-align: center; font-size: 0.85em; color: var(--fg-secondary); margin: 0 0 36px; }
+pre{background:#0a0a0a;padding:1rem 1.2rem;font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.78rem;line-height:1.55;color:#888;overflow-x:auto;margin:0.8rem 0 1.2rem;border-radius:2px}
+code{font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.85em;color:#888}
+p code,li code,td code{background:#0a0a0a;padding:1px 5px;border-radius:2px}
 
-/* Abstract */
-.abstract {
-  background: var(--abstract-bg); border-left: 3px solid var(--abstract-border);
-  padding: 16px 20px; margin: 0 0 40px; font-size: 0.92em;
-  transition: background 0.3s, border-color 0.3s;
-}
-.abstract-label {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  font-weight: 700; font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 6px;
-}
+/* tables */
+.tbl{overflow-x:auto;margin:0.6rem 0 1.4rem}
+.tbl .cap{font-size:0.72rem;color:#444;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.5rem}
+table{width:100%;border-collapse:collapse;font-size:0.82rem;font-variant-numeric:tabular-nums}
+thead th{padding:0.5rem 0.7rem;text-align:left;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:#555;font-weight:500;border-bottom:1px solid #222}
+th.r,td.r{text-align:right}
+tbody td{padding:0.4rem 0.7rem;color:#999;border-bottom:1px solid #0d0d0d}
+tbody tr:hover{background:#0a0a0a}
+tr.peak td{color:#fff;font-weight:500}
 
-/* Headline number */
-.hero-stat {
-  text-align: center; margin: 0 0 40px; padding: 24px 0;
-  border-top: 2px solid var(--rule-color); border-bottom: 2px solid var(--rule-color);
-}
-.hero-stat .big { font-size: 2.8em; font-weight: 700; line-height: 1.1; }
-.hero-stat .sub { font-size: 0.95em; color: var(--fg-secondary); margin-top: 4px; }
+.note{margin:1rem 0 1.4rem;padding:1rem 1.2rem;background:#0a0a0a;border-left:2px solid #333;font-size:0.88rem;color:#999}
+.note strong{color:#fff}
 
-/* Sections */
-h2 {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  font-size: 1.25em; font-weight: 700; margin: 44px 0 12px;
-  padding-bottom: 4px; border-bottom: 1px solid var(--rule-color-light);
-}
-h3 {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  font-size: 1.05em; font-weight: 700; margin: 28px 0 8px;
-}
-p { margin: 0 0 14px; }
+.eq{text-align:center;padding:0.8rem 0;font-size:0.9rem;color:#666}
 
-/* Tables */
-.table-wrap { overflow-x: auto; margin: 20px 0 28px; }
-.table-caption { font-size: 0.85em; color: var(--fg-secondary); margin: 0 0 6px; font-style: italic; }
-table { width: 100%; border-collapse: collapse; font-size: 0.88em; line-height: 1.5; }
-thead tr { border-top: 2px solid var(--rule-color); border-bottom: 1px solid var(--rule-color); }
-thead th {
-  padding: 8px 12px; text-align: left;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-  font-weight: 600; font-size: 0.92em;
-  background: var(--table-header-bg); color: var(--table-header-fg);
-  transition: background 0.3s, color 0.3s;
-}
-thead th.right { text-align: right; }
-tbody tr { border-bottom: none; }
-tbody tr:last-child { border-bottom: 2px solid var(--rule-color); }
-tbody td { padding: 6px 12px; vertical-align: top; }
-tbody td.right { text-align: right; font-variant-numeric: tabular-nums; }
-tbody tr:nth-child(even) { background: var(--table-stripe); }
-tbody tr.highlight { font-weight: 700; }
+.refs{font-size:0.82rem;color:#555}
+.refs ol{padding-left:1.2rem}
+.refs li{margin-bottom:0.4rem}
 
-/* Code */
-pre {
-  background: var(--code-bg); border: 1px solid var(--code-border); border-radius: 4px;
-  padding: 14px 16px; overflow-x: auto; font-size: 0.82em; line-height: 1.6; margin: 16px 0 20px;
-  transition: background 0.3s, border-color 0.3s;
-}
-code {
-  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', Menlo, Consolas, monospace;
-  color: var(--code-fg); font-size: 0.92em;
-}
-pre code { font-size: 1em; }
+footer{padding:2rem 0 4rem;text-align:center}
+footer p{font-size:0.72rem;color:#333;letter-spacing:0.02em}
+footer a{color:#333}
+footer a:hover{color:#666}
 
-/* Inline code */
-p code, li code, td code {
-  background: var(--code-bg); padding: 1px 5px; border-radius: 3px; border: 1px solid var(--code-border);
-}
-
-/* Lists */
-ul, ol { padding-left: 24px; margin: 0 0 14px; }
-li { margin-bottom: 4px; }
-
-/* Highlight box */
-.callout {
-  background: var(--highlight-bg); border-left: 3px solid var(--highlight-border);
-  padding: 12px 16px; margin: 16px 0 20px; font-size: 0.92em;
-  transition: background 0.3s, border-color 0.3s;
-}
-
-/* References */
-.references { font-size: 0.88em; }
-.references ol { padding-left: 20px; }
-.references li { margin-bottom: 8px; color: var(--fg-secondary); }
-
-/* Footer */
-.paper-footer {
-  margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--rule-color-light);
-  font-size: 0.8em; color: var(--fg-secondary); text-align: center;
-}
-
-/* Responsive */
-@media (max-width: 600px) {
-  .paper { padding: 40px 16px 60px; }
-  .paper-title { font-size: 1.4em; }
-  .hero-stat .big { font-size: 2em; }
-  h2 { font-size: 1.1em; }
-  table { font-size: 0.8em; }
-  thead th, tbody td { padding: 5px 8px; }
-  .toggle-wrap { top: 10px; right: 10px; font-size: 10px; padding: 5px 10px; }
+@media(max-width:600px){
+  html{font-size:13px}
+  header{padding:3rem 0 2rem}
+  header h1{font-size:2rem}
+  .hero .big{font-size:2.4rem}
+  .container{padding:0 1.2rem}
+  table{font-size:0.75rem}
+  thead th,tbody td{padding:0.3rem 0.5rem}
 }
 </style>
 </head>
 <body>
+<div class="container">
 
-<div class="toggle-wrap" id="themeToggle">
-  <button class="theme-btn active" data-theme="bw">B&amp;W</button>
-  <button class="theme-btn" data-theme="color">Color</button>
-  <button class="theme-btn" data-theme="dark">Dark</button>
-</div>
-
-<div class="paper">
-
-<h1 class="paper-title">rvLLM: A High-Performance LLM Inference Engine in Rust</h1>
-<p class="paper-author">m0at</p>
-<p class="paper-links">
-  <a href="https://github.com/m0at/rvllm">GitHub</a>
-  <a href="paper/rvllm.pdf">PDF (color)</a>
-  <a href="paper/rvllm-bw.pdf">PDF (B&amp;W)</a>
-</p>
-<p class="paper-date">March 2026</p>
-
-<div class="hero-stat">
-  <div class="big">3,946 tok/s</div>
-  <div class="sub">16--20x faster than Python vLLM. Zero errors across 14,620 verified requests.</div>
-</div>
-
-<div class="abstract">
-  <div class="abstract-label">Abstract</div>
-  <p>
-    We present rvLLM, a from-scratch Rust implementation of the vLLM inference engine
-    for OpenAI-compatible API serving with CUDA GPU acceleration. The system comprises
-    23 Rust crates and 15 pre-compiled CUDA PTX kernels, compiling to a single 16 MB
-    static binary. On a single NVIDIA B200 (180 GB), rvLLM achieves 3,946 tok/s
-    serving Qwen2.5-1.5B with zero errors across 13,553 verified requests at batch
-    sizes up to N=4,096. On a single A100 SXM4 (40 GB), it reaches 3,191 tok/s --
-    <strong>16x faster</strong> than Python vLLM 0.18 on identical hardware. This speedup derives
-    from three reinforcing mechanisms: (1) GPU-resident greedy decoding via an argmax
-    kernel that reduces device-to-host transfer by ~32,000x per token, (2) CUDA graph
-    replay that collapses the entire decode forward pass into a single driver call, and
-    (3) a zero-copy memory architecture with no Python objects, no PyTorch tensor metadata,
-    and no garbage collector. Startup time is 6--9 seconds versus 121 seconds for Python vLLM,
-    CPU RSS is 348 MB versus 1,033 MB, and the binary is 31x smaller.
+<header>
+  <h1>rvLLM</h1>
+  <p class="sub">High-performance LLM inference in Rust. 23 crates. 15 CUDA kernels. 16 MB binary.</p>
+  <p class="links">
+    <a href="https://github.com/m0at/rvllm">GitHub</a>
+    <a href="paper/rvllm.pdf">Paper (color)</a>
+    <a href="paper/rvllm-bw.pdf">Paper (B&W)</a>
+    <a href="paper/rvllm-dark.pdf">Paper (dark)</a>
   </p>
+</header>
+
+<div class="hero">
+  <div class="big">3,946 tok/s</div>
+  <div class="sub">16-20x faster than Python vLLM. Zero errors across 14,620 verified requests. One developer, $1,780.</div>
 </div>
 
-<!-- 1. Introduction -->
-<h2>1. Introduction</h2>
+<section>
+<h2>Abstract</h2>
+<p class="section-sub">Andy Norris (m0at) -- San Francisco, March 28 2026</p>
 <p>
-  Large language model inference serving has become critical infrastructure. The dominant
-  open-source engine, vLLM, introduced PagedAttention for efficient KV cache management.
-  However, vLLM is implemented in Python with PyTorch, which introduces systemic bottlenecks:
+  rvLLM is a from-scratch Rust implementation of the vLLM inference engine for OpenAI-compatible
+  API serving with CUDA GPU acceleration. 23 Rust crates and 15 pre-compiled CUDA PTX kernels,
+  compiling to a single 16 MB static binary. On a single NVIDIA B200 (180 GB), rvLLM achieves
+  3,946 tok/s serving Qwen2.5-1.5B with zero errors across 13,553 verified requests at batch
+  sizes up to $N\!=\!4{,}096$. On a single A100 SXM4 (40 GB), it reaches
+  3,191 tok/s -- <strong>16x faster</strong> than Python vLLM 0.18 on identical hardware.
 </p>
-<ul>
-  <li><strong>Python's GIL</strong> serialises the scheduler, tokenizer, and output processing. At high concurrency, the scheduling loop itself becomes the bottleneck.</li>
-  <li><strong>Garbage collection pauses</strong> grow as Python tracks millions of tensor metadata objects. Each <code>torch.Tensor</code> carries ~50 bytes of overhead.</li>
-  <li><strong>Deployment complexity:</strong> ~500 MB of dependencies, 30--120 second startup for imports, Triton JIT, and NCCL init.</li>
-  <li><strong>The device-to-host bottleneck:</strong> after the GPU forward pass, the entire logit matrix is transferred to host for Python-side sampling. For Qwen2.5-1.5B (vocab 151,936) at batch 128, that's 74 MB per decode step.</li>
-</ul>
 <p>
-  rvLLM addresses all of these. A single 16 MB binary with zero runtime dependencies. Rust's
-  ownership model for deterministic deallocation. Direct cuBLAS and CUDA kernel invocation.
-  And a GPU-side argmax kernel that reduces the dominant DtoH transfer from 74 MB to 512 bytes
-  for a 128-sequence greedy decode step -- a ~150,000x reduction.
+  The speedup derives from three reinforcing mechanisms: GPU-resident greedy decoding via an
+  argmax kernel that reduces device-to-host transfer by ~32,000x per token, CUDA graph replay
+  that collapses the entire decode forward pass into a single driver call, and a zero-copy
+  memory architecture with no Python objects, no PyTorch tensor metadata, and no garbage collector.
 </p>
+</section>
 
-<!-- 2. Architecture -->
-<h2>2. Architecture</h2>
-<p>
-  23 Rust crates organized in a strict dependency tree from GPU primitives to the HTTP API surface.
-</p>
-<pre><code>rvllm-server (binary, 16MB)
-  |
-  +-- rvllm-api                  HTTP: axum, SSE streaming, OpenAI routes
-  |     +-- rvllm-engine         Async inference loop: scheduler + executor + tokenizer
-  |     |     +-- rvllm-scheduler       Continuous batching, FCFS/priority/SJF
-  |     |     +-- rvllm-executor        Single/multi-GPU worker orchestration
-  |     |     |     +-- rvllm-worker    Per-GPU execution: forward pass + sampling
-  |     |     +-- rvllm-speculative     Draft-model speculative decoding
-  |     +-- rvllm-telemetry      Prometheus metrics, structured tracing
-  |
-  +-- rvllm-model-runner         Transformer forward pass, layer implementations
-  |     +-- rvllm-attention      PagedAttention, FlashAttention backends
-  |     +-- rvllm-kv-cache       Paged key-value cache, block tables
-  |     +-- rvllm-model-loader   SafeTensors/GGUF loading, HF hub, sharding
-  |     +-- rvllm-quant          GPTQ/AWQ/FP8 dequantization
-  |
-  +-- rvllm-sampling             Logit processing, top-k/p, multinomial, Rayon
-  +-- rvllm-block-manager        Block allocation, copy-on-write, prefix sharing
-  +-- rvllm-memory               GPU/CPU memory pools, swap manager
-  +-- rvllm-gpu                  CUDA/mock abstraction, cuBLAS, kernel loader
-  +-- rvllm-tokenizer            HuggingFace tokenizers, chat templates
-  +-- rvllm-sequence             Sequence state, request groups, metadata
-  +-- rvllm-config               CLI args, TOML config, validation
-  +-- rvllm-python               PyO3 Python bindings
-  +-- rvllm-core                 Shared types, error hierarchy, prelude</code></pre>
+<section>
+<h2>The GPU Argmax Kernel</h2>
+<p class="section-sub">The single most impactful optimisation</p>
+<div class="note">
+  Standard LLM serving transfers the entire logit matrix from GPU to host every decode step.
+  For Qwen2.5-1.5B at batch 128: <strong>74 MB per step</strong>. The argmax kernel finds the
+  max-probability token directly on GPU: <strong>512 bytes per step</strong>. A ~150,000x reduction.
+</div>
+<div class="eq">
+  $\text{DtoH}_{\text{logits}} = 128 \times 151{,}936 \times 4 = 74.2\;\text{MB}$
+  &nbsp;&nbsp;vs.&nbsp;&nbsp;
+  $\text{DtoH}_{\text{argmax}} = 128 \times 4 = 512\;\text{B}$
+</div>
+</section>
 
-<h3>2.1 The Forward Pass</h3>
-<p>
-  All activations remain on GPU throughout the entire layer loop. The execution flow per step:
-</p>
+<section>
+<h2>B200 Throughput</h2>
+<p class="section-sub">180 GB VRAM, $3.13/hr on vast.ai -- 13,553 total requests, zero errors</p>
+<div class="tbl">
+<table>
+<thead><tr><th class="r">N</th><th class="r">Tokens</th><th class="r">Wall (ms)</th><th class="r">tok/s</th><th class="r">Errors</th></tr></thead>
+<tbody>
+<tr><td class="r">1</td><td class="r">32</td><td class="r">279</td><td class="r">114</td><td class="r">0</td></tr>
+<tr><td class="r">4</td><td class="r">128</td><td class="r">762</td><td class="r">167</td><td class="r">0</td></tr>
+<tr><td class="r">8</td><td class="r">256</td><td class="r">601</td><td class="r">425</td><td class="r">0</td></tr>
+<tr><td class="r">16</td><td class="r">512</td><td class="r">826</td><td class="r">619</td><td class="r">0</td></tr>
+<tr><td class="r">32</td><td class="r">1,024</td><td class="r">1,346</td><td class="r">760</td><td class="r">0</td></tr>
+<tr><td class="r">64</td><td class="r">2,048</td><td class="r">798</td><td class="r">2,566</td><td class="r">0</td></tr>
+<tr><td class="r">128</td><td class="r">4,096</td><td class="r">1,249</td><td class="r">3,279</td><td class="r">0</td></tr>
+<tr><td class="r">256</td><td class="r">8,192</td><td class="r">2,106</td><td class="r">3,889</td><td class="r">0</td></tr>
+<tr><td class="r">512</td><td class="r">16,384</td><td class="r">4,179</td><td class="r">3,920</td><td class="r">0</td></tr>
+<tr class="peak"><td class="r">768</td><td class="r">24,576</td><td class="r">6,227</td><td class="r">3,946</td><td class="r">0</td></tr>
+<tr><td class="r">1,024</td><td class="r">32,768</td><td class="r">8,365</td><td class="r">3,917</td><td class="r">0</td></tr>
+<tr><td class="r">2,048</td><td class="r">65,536</td><td class="r">16,640</td><td class="r">3,938</td><td class="r">0</td></tr>
+<tr><td class="r">4,096</td><td class="r">131,072</td><td class="r">34,002</td><td class="r">3,854</td><td class="r">0</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>A100 Throughput</h2>
+<p class="section-sub">SXM4 40 GB, $0.60/hr -- 1,067 total requests, zero errors</p>
+<div class="tbl">
+<table>
+<thead><tr><th class="r">N</th><th class="r">Tokens</th><th class="r">Wall (ms)</th><th class="r">tok/s</th><th>vs vLLM</th><th class="r">Errors</th></tr></thead>
+<tbody>
+<tr><td class="r">1</td><td class="r">32</td><td class="r">731</td><td class="r">43</td><td>0.2x</td><td class="r">0</td></tr>
+<tr><td class="r">4</td><td class="r">128</td><td class="r">561</td><td class="r">228</td><td>1.1x</td><td class="r">0</td></tr>
+<tr><td class="r">8</td><td class="r">256</td><td class="r">681</td><td class="r">375</td><td>1.9x</td><td class="r">0</td></tr>
+<tr><td class="r">16</td><td class="r">512</td><td class="r">901</td><td class="r">568</td><td>2.8x</td><td class="r">0</td></tr>
+<tr><td class="r">32</td><td class="r">1,024</td><td class="r">1,286</td><td class="r">796</td><td>4.0x</td><td class="r">0</td></tr>
+<tr><td class="r">48</td><td class="r">1,536</td><td class="r">752</td><td class="r">2,042</td><td>10.2x</td><td class="r">0</td></tr>
+<tr><td class="r">64</td><td class="r">2,048</td><td class="r">824</td><td class="r">2,485</td><td>12.4x</td><td class="r">0</td></tr>
+<tr><td class="r">96</td><td class="r">3,072</td><td class="r">1,181</td><td class="r">2,601</td><td>13.0x</td><td class="r">0</td></tr>
+<tr><td class="r">128</td><td class="r">4,096</td><td class="r">1,368</td><td class="r">2,994</td><td>15.0x</td><td class="r">0</td></tr>
+<tr><td class="r">256</td><td class="r">8,192</td><td class="r">2,570</td><td class="r">3,187</td><td>15.9x</td><td class="r">0</td></tr>
+<tr class="peak"><td class="r">512</td><td class="r">16,384</td><td class="r">5,134</td><td class="r">3,191</td><td><strong>16.0x</strong></td><td class="r">0</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>System Comparison</h2>
+<p class="section-sub">vs Python vLLM 0.18</p>
+<div class="tbl">
+<table>
+<thead><tr><th>Metric</th><th class="r">rvLLM (B200)</th><th class="r">rvLLM (A100)</th><th class="r">Python vLLM</th><th>Ratio</th></tr></thead>
+<tbody>
+<tr><td>Peak throughput</td><td class="r">3,946 tok/s</td><td class="r">3,191 tok/s</td><td class="r">200 tok/s</td><td>16-20x</td></tr>
+<tr><td>Max verified batch</td><td class="r">N=4,096</td><td class="r">N=512</td><td class="r">--</td><td>--</td></tr>
+<tr><td>Total verified</td><td class="r">13,553</td><td class="r">1,067</td><td class="r">--</td><td>0 errors</td></tr>
+<tr><td>Startup time</td><td class="r">9s</td><td class="r">6s</td><td class="r">121s</td><td>15-20x</td></tr>
+<tr><td>Binary size</td><td class="r">16 MB</td><td class="r">16 MB</td><td class="r">~500 MB</td><td>31x</td></tr>
+<tr><td>CPU RSS</td><td class="r">--</td><td class="r">348 MB</td><td class="r">1,033 MB</td><td>3x</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Where the Speed Comes From</h2>
+<p class="section-sub">Compound effect of seven reinforcing mechanisms</p>
 <ol>
-  <li>HtoD upload of metadata: token IDs, positions, context lengths, block tables, slot mappings, and <code>seq_start_pos</code> (cumulative query-length prefix sums for mixed prefill+decode).</li>
-  <li>Embedding lookup via <code>embedding_gather_kernel</code> (GPU-resident).</li>
-  <li>N transformer layers: RMSNorm, Q/K/V projections (cuBLAS), rotary embedding, reshape-and-cache (scatter K/V into paged cache), FlashAttention-2, output projection, residual + post-norm, gate/up projections, SiLU activation, down projection, second residual.</li>
-  <li>Final RMSNorm and LM head projection (cuBLAS).</li>
-  <li><strong>Greedy fast path:</strong> GPU argmax kernel returns one <code>i32</code> per sequence. Non-greedy: full logit transfer to host for CPU sampling.</li>
+<li><strong>GPU-resident argmax</strong> -- eliminates 74 MB DtoH per step (~3 ms at PCIe Gen4)</li>
+<li><strong>CUDA graph replay</strong> -- one <code>cuGraphLaunch</code> per decode step</li>
+<li><strong>Mixed prefill+decode batching</strong> -- no pipeline bubbles</li>
+<li><strong>No GIL</strong> -- parallel scheduling, tokenisation, sampling via Rayon</li>
+<li><strong>No GC pauses</strong> -- deterministic deallocation via Rust ownership</li>
+<li><strong>Zero-copy activations</strong> -- all on GPU throughout N-layer forward pass</li>
+<li><strong>Prefix caching</strong> -- shared system prompts reuse KV blocks</li>
 </ol>
+</section>
 
-<h3>2.2 Mixed Prefill+Decode Batching</h3>
-<p>
-  Prefill sequences (q_len > 1) and decode sequences (q_len = 1) coexist in the same GPU batch.
-  The <code>seq_start_pos</code> array disambiguates them to the attention kernel. This eliminates
-  the pipeline bubble between prefill and decode phases.
-</p>
+<section>
+<h2>Architecture</h2>
+<p class="section-sub">23 crates, 15 CUDA kernels, 771 tests</p>
+<pre>rvllm-server (16MB)
+  +-- rvllm-api              axum, SSE, OpenAI routes
+  |     +-- rvllm-engine     scheduler + executor + tokenizer
+  |     |     +-- rvllm-scheduler    continuous batching
+  |     |     +-- rvllm-executor     GPU orchestration
+  |     |     |     +-- rvllm-worker forward pass + sampling
+  |     |     +-- rvllm-speculative  draft-model decoding
+  |     +-- rvllm-telemetry  Prometheus, tracing
+  +-- rvllm-model-runner     transformer forward pass
+  |     +-- rvllm-attention  PagedAttention, FA2
+  |     +-- rvllm-kv-cache   paged KV, block tables
+  |     +-- rvllm-model-loader SafeTensors, HF hub
+  |     +-- rvllm-quant      GPTQ/AWQ/FP8
+  +-- rvllm-sampling         top-k/p, Rayon parallel
+  +-- rvllm-block-manager    CoW, prefix sharing
+  +-- rvllm-memory           GPU/CPU pools, swap
+  +-- rvllm-gpu              CUDA/mock, cuBLAS, PTX loader
+  +-- rvllm-tokenizer        HF tokenizers, chat templates
+  +-- rvllm-sequence         state machine, metadata
+  +-- rvllm-config           CLI, TOML, validation
+  +-- rvllm-python           PyO3 bindings
+  +-- rvllm-core             types, errors, prelude</pre>
+</section>
 
-<h3>2.3 Memory Management</h3>
-<p>
-  The entire KV cache is allocated as <strong>one <code>cudaMalloc</code> call</strong> at startup.
-  Block allocation is a <code>VecDeque::pop_front</code>; deallocation is <code>push_back</code>.
-  Zero per-request GPU allocation calls. Copy-on-write for beam search. LRU prefix caching for
-  shared system prompts. Swap to pinned CPU memory when GPU blocks are exhausted.
-</p>
-
-<!-- 3. CUDA Integration -->
-<h2>3. CUDA Integration</h2>
-
-<h3>3.1 The GPU Argmax Kernel</h3>
-<div class="callout">
-  <strong>The single most impactful optimisation.</strong> Standard LLM serving transfers the
-  entire logit matrix (batch x vocab x 4 bytes) from GPU to host every decode step. For
-  Qwen2.5-1.5B at batch 128: <strong>74 MB per step</strong>. The argmax kernel finds the
-  max-probability token directly on GPU and returns only the winning token IDs:
-  <strong>512 bytes per step</strong>. A ~150,000x reduction in per-step DtoH transfer.
+<section>
+<h2>CUDA Kernels</h2>
+<p class="section-sub">15 hand-written, compiled to PTX for sm_70 through sm_100</p>
+<div class="tbl">
+<table>
+<thead><tr><th>Kernel</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>PagedAttention V2</td><td>Block-table indirection, online softmax</td></tr>
+<tr><td>FlashAttention-2</td><td>Tiled prefill + decode, causal mask, paged KV</td></tr>
+<tr><td>RMSNorm / RMSNorm FP16</td><td>Shared-memory parallel reduction</td></tr>
+<tr><td>Fused Residual+Norm</td><td>Single-kernel residual add + normalise</td></tr>
+<tr><td>Rotary Embedding</td><td>RoPE with GQA support</td></tr>
+<tr><td>Activation / Activation FP16</td><td>SiLU, GELU, fused SiLU*mul</td></tr>
+<tr><td>Softmax</td><td>Warp-level numerically stable</td></tr>
+<tr class="peak"><td>Argmax</td><td>GPU-side greedy sampling (the key one)</td></tr>
+<tr><td>Embedding Gather</td><td>Token embedding table lookup</td></tr>
+<tr><td>Reshape and Cache</td><td>Scatter K/V into paged cache</td></tr>
+<tr><td>Block Copy</td><td>KV block copy for beam search CoW</td></tr>
+<tr><td>Add Bias</td><td>Fused bias addition for QKV</td></tr>
+<tr><td>FP8 KV</td><td>E4M3 quantisation/dequantisation</td></tr>
+</tbody>
+</table>
 </div>
+</section>
 
-<h3>3.2 All 15 CUDA Kernels</h3>
-<div class="table-wrap">
-  <table>
-    <thead>
-      <tr><th>Kernel</th><th>File</th><th>Purpose</th></tr>
-    </thead>
-    <tbody>
-      <tr><td>PagedAttention V2</td><td><code>paged_attention.cu</code></td><td>Block-table indirection, online softmax</td></tr>
-      <tr><td>FlashAttention-2</td><td><code>flash_attention.cu</code></td><td>Tiled prefill + decode with causal mask, paged KV</td></tr>
-      <tr><td>RMSNorm (FP32)</td><td><code>rms_norm.cu</code></td><td>Shared-memory parallel reduction</td></tr>
-      <tr><td>RMSNorm (FP16)</td><td><code>rms_norm_f16.cu</code></td><td>Half-precision variant</td></tr>
-      <tr><td>Fused Residual+Norm</td><td><code>fused_residual_rmsnorm.cu</code></td><td>Single-kernel residual add + normalise</td></tr>
-      <tr><td>Rotary Embedding</td><td><code>rotary_embedding.cu</code></td><td>RoPE with GQA support</td></tr>
-      <tr><td>Activation (FP32)</td><td><code>activation.cu</code></td><td>SiLU, GELU, fused SiLU*mul</td></tr>
-      <tr><td>Activation (FP16)</td><td><code>activation_f16.cu</code></td><td>Half-precision MLP activations</td></tr>
-      <tr><td>Softmax</td><td><code>softmax.cu</code></td><td>Warp-level numerically stable softmax</td></tr>
-      <tr><td><strong>Argmax</strong></td><td><code>argmax.cu</code></td><td><strong>GPU-side greedy sampling</strong></td></tr>
-      <tr><td>Embedding Gather</td><td><code>embedding_gather.cu</code></td><td>Token embedding table lookup</td></tr>
-      <tr><td>Reshape and Cache</td><td><code>reshape_and_cache.cu</code></td><td>Scatter K/V into paged cache</td></tr>
-      <tr><td>Block Copy</td><td><code>copy_blocks.cu</code></td><td>KV block copy for beam search CoW</td></tr>
-      <tr><td>Add Bias</td><td><code>add_bias.cu</code></td><td>Fused bias addition for QKV</td></tr>
-      <tr><td>FP8 KV</td><td><code>fp8_kv.cu</code></td><td>E4M3 quantisation/dequantisation</td></tr>
-    </tbody>
-  </table>
+<section>
+<h2>CPU Benchmarks</h2>
+<p class="section-sub">Apple M5, 10 cores</p>
+<div class="tbl">
+<table>
+<thead><tr><th>Operation</th><th class="r">Rust</th><th class="r">Python</th><th class="r">Speedup</th></tr></thead>
+<tbody>
+<tr><td>Combined penalties</td><td class="r">2.6 us</td><td class="r">63 us</td><td class="r">24x</td></tr>
+<tr><td>Repetition penalty (2K)</td><td class="r">3.1 us</td><td class="r">34 us</td><td class="r">11x</td></tr>
+<tr><td>Multinomial (32K vocab)</td><td class="r">12 us</td><td class="r">66 us</td><td class="r">5.5x</td></tr>
+<tr><td>Top-p nucleus (128K)</td><td class="r">1.6 ms</td><td class="r">6.9 ms</td><td class="r">4.3x</td></tr>
+<tr><td>Batch sampling (64 seqs)</td><td class="r">4.3 ms</td><td class="r">36.4 ms</td><td class="r">8.5x</td></tr>
+</tbody>
+</table>
 </div>
+</section>
 
-<h3>3.3 CUDA Graph Replay</h3>
-<p>
-  After 3 warmup calls, decode steps are captured into CUDA graphs keyed by padded batch size
-  {1, 2, 4, 8, 16, 32}. <code>cuGraphLaunch</code> replays the entire forward pass as a single
-  driver call, eliminating ~100 us of per-kernel launch overhead per step.
-</p>
-
-<!-- 4. Why Less Memory -->
-<h2>4. Why rvLLM Uses Less Memory</h2>
-<p>The advantage is structural, not algorithmic. Same PagedAttention algorithm, different per-object overhead:</p>
-<ul>
-  <li><strong>No Python objects:</strong> A KV block in Python vLLM is a dict with ~50 bytes overhead. In rvLLM it's a <code>u32</code> ID + <code>AtomicUsize</code> ref count = 24 bytes in a pre-allocated <code>VecDeque</code>.</li>
-  <li><strong>No PyTorch tensor metadata:</strong> Every <code>torch.Tensor</code> carries autograd state, strides, device info. rvLLM holds <code>CudaSlice&lt;f32&gt;</code> -- a pointer and length.</li>
-  <li><strong>Single pre-allocated slab:</strong> One <code>cudaMalloc</code> at startup. No per-request GPU allocation.</li>
-  <li><strong>Memory-mapped weight loading:</strong> <code>memmap2</code> maps SafeTensors from disk. The OS pages on demand; the model is never fully in CPU RAM.</li>
-  <li><strong>No NCCL buffers:</strong> Single-card inference eliminates tensor parallelism overhead (5--15% NVLink overhead + ~2--5 ms NCCL sync per step).</li>
-</ul>
-
-<h3>4.1 The Single-Card Advantage</h3>
-<p>
-  A single B200 at 8 TB/s memory bandwidth reads 140 GB of a 70B model in 17.5 ms. With N=64
-  concurrent sequences, each 17.5 ms window produces 64 tokens = 3,657 tok/s. No multi-GPU
-  communication overhead. This matches the empirical plateau we observe.
-</p>
-
-<!-- 5. Results -->
-<h2>5. Results</h2>
-<p>
-  All benchmarks: Qwen2.5-1.5B, greedy decoding (temperature=0), 32 output tokens/request,
-  max_model_len=4096. Coherence verified at every batch size. Python vLLM 0.18 baseline: 200 tok/s.
-</p>
-
-<h3>5.1 B200 Throughput Scaling (180 GB VRAM, $3.13/hr)</h3>
-<div class="table-wrap">
-  <p class="table-caption">Table 1. B200 scaling. Zero errors across all batch sizes. 13,553 total requests.</p>
-  <table>
-    <thead>
-      <tr><th class="right">N</th><th class="right">Tokens</th><th class="right">Wall (ms)</th><th class="right">tok/s</th><th class="right">Errors</th></tr>
-    </thead>
-    <tbody>
-      <tr><td class="right">1</td><td class="right">32</td><td class="right">279</td><td class="right">114</td><td class="right">0</td></tr>
-      <tr><td class="right">4</td><td class="right">128</td><td class="right">762</td><td class="right">167</td><td class="right">0</td></tr>
-      <tr><td class="right">8</td><td class="right">256</td><td class="right">601</td><td class="right">425</td><td class="right">0</td></tr>
-      <tr><td class="right">16</td><td class="right">512</td><td class="right">826</td><td class="right">619</td><td class="right">0</td></tr>
-      <tr><td class="right">32</td><td class="right">1,024</td><td class="right">1,346</td><td class="right">760</td><td class="right">0</td></tr>
-      <tr><td class="right">64</td><td class="right">2,048</td><td class="right">798</td><td class="right">2,566</td><td class="right">0</td></tr>
-      <tr><td class="right">128</td><td class="right">4,096</td><td class="right">1,249</td><td class="right">3,279</td><td class="right">0</td></tr>
-      <tr><td class="right">256</td><td class="right">8,192</td><td class="right">2,106</td><td class="right">3,889</td><td class="right">0</td></tr>
-      <tr><td class="right">512</td><td class="right">16,384</td><td class="right">4,179</td><td class="right">3,920</td><td class="right">0</td></tr>
-      <tr class="highlight"><td class="right">768</td><td class="right">24,576</td><td class="right">6,227</td><td class="right">3,946</td><td class="right">0</td></tr>
-      <tr><td class="right">1,024</td><td class="right">32,768</td><td class="right">8,365</td><td class="right">3,917</td><td class="right">0</td></tr>
-      <tr><td class="right">2,048</td><td class="right">65,536</td><td class="right">16,640</td><td class="right">3,938</td><td class="right">0</td></tr>
-      <tr><td class="right">4,096</td><td class="right">131,072</td><td class="right">34,002</td><td class="right">3,854</td><td class="right">0</td></tr>
-    </tbody>
-  </table>
+<section>
+<h2>Development Cost</h2>
+<p class="section-sub">One developer, ~4 weeks</p>
+<div class="tbl">
+<table>
+<thead><tr><th>Category</th><th>Details</th><th class="r">Cost</th></tr></thead>
+<tbody>
+<tr><td>GPU compute</td><td>vast.ai A100 ($0.60-1.15/hr)</td><td class="r">$1,000</td></tr>
+<tr><td>GPU compute</td><td>vast.ai B200 ($3.13-12.08/hr)</td><td class="r">$500</td></tr>
+<tr><td>AI assistance</td><td>Claude Code extra usage</td><td class="r">$280</td></tr>
+<tr class="peak"><td>Total</td><td></td><td class="r">$1,780</td></tr>
+</tbody>
+</table>
 </div>
+</section>
 
-<h3>5.2 A100 SXM4 40 GB Throughput Scaling ($0.60/hr)</h3>
-<div class="table-wrap">
-  <p class="table-caption">Table 2. A100 scaling. Zero errors across all batch sizes. 1,067 total requests.</p>
-  <table>
-    <thead>
-      <tr><th class="right">N</th><th class="right">Tokens</th><th class="right">Wall (ms)</th><th class="right">tok/s</th><th>vs vLLM</th><th class="right">Errors</th></tr>
-    </thead>
-    <tbody>
-      <tr><td class="right">1</td><td class="right">32</td><td class="right">731</td><td class="right">43</td><td>0.2x</td><td class="right">0</td></tr>
-      <tr><td class="right">4</td><td class="right">128</td><td class="right">561</td><td class="right">228</td><td>1.1x</td><td class="right">0</td></tr>
-      <tr><td class="right">8</td><td class="right">256</td><td class="right">681</td><td class="right">375</td><td>1.9x</td><td class="right">0</td></tr>
-      <tr><td class="right">16</td><td class="right">512</td><td class="right">901</td><td class="right">568</td><td>2.8x</td><td class="right">0</td></tr>
-      <tr><td class="right">32</td><td class="right">1,024</td><td class="right">1,286</td><td class="right">796</td><td>4.0x</td><td class="right">0</td></tr>
-      <tr><td class="right">48</td><td class="right">1,536</td><td class="right">752</td><td class="right">2,042</td><td>10.2x</td><td class="right">0</td></tr>
-      <tr><td class="right">64</td><td class="right">2,048</td><td class="right">824</td><td class="right">2,485</td><td>12.4x</td><td class="right">0</td></tr>
-      <tr><td class="right">96</td><td class="right">3,072</td><td class="right">1,181</td><td class="right">2,601</td><td>13.0x</td><td class="right">0</td></tr>
-      <tr><td class="right">128</td><td class="right">4,096</td><td class="right">1,368</td><td class="right">2,994</td><td>15.0x</td><td class="right">0</td></tr>
-      <tr><td class="right">256</td><td class="right">8,192</td><td class="right">2,570</td><td class="right">3,187</td><td>15.9x</td><td class="right">0</td></tr>
-      <tr class="highlight"><td class="right">512</td><td class="right">16,384</td><td class="right">5,134</td><td class="right">3,191</td><td><strong>16.0x</strong></td><td class="right">0</td></tr>
-    </tbody>
-  </table>
-</div>
+<section>
+<h2>Coherence</h2>
+<p class="section-sub">Verified on 5 diverse prompts at every batch size</p>
+<pre>"The capital of France is"
+ -> Paris. The capital of France is Paris...
 
-<h3>5.3 Coherence Verification</h3>
-<pre><code>Prompt: "The capital of France is"
-Output: "Paris. The capital of France is Paris..."
+"Write a function that sorts a list in Python:"
+ -> def sort_list(list): return sorted(list)
 
-Prompt: "Write a function that sorts a list in Python:"
-Output: "def sort_list(list): return sorted(list)"
-
-Prompt: "Explain quantum computing in simple terms:"
-Output: "Quantum computing is a new type of computing
-         that uses quantum mechanics..."</code></pre>
+"Explain quantum computing in simple terms:"
+ -> Quantum computing is a new type of computing
+    that uses quantum mechanics...</pre>
 <p>
-  Verified on 5 diverse prompts at N=1 and N=5 concurrent. Sampled at N=128 and N=1,024 --
-  all on-topic and coherent. Zero degenerate output across any batch size on either GPU.
+  Zero degenerate output across any batch size on either GPU.
+  Sampled at N=128 and N=1,024 -- all coherent.
 </p>
+</section>
 
-<h3>5.4 System Comparison</h3>
-<div class="table-wrap">
-  <p class="table-caption">Table 3. System-level comparison with Python vLLM 0.18.</p>
-  <table>
-    <thead>
-      <tr><th>Metric</th><th class="right">rvLLM (B200)</th><th class="right">rvLLM (A100)</th><th class="right">Python vLLM</th><th>Ratio</th></tr>
-    </thead>
-    <tbody>
-      <tr><td>Peak throughput</td><td class="right">3,946 tok/s</td><td class="right">3,191 tok/s</td><td class="right">200 tok/s</td><td>16--20x</td></tr>
-      <tr><td>Max verified batch</td><td class="right">N=4,096</td><td class="right">N=512</td><td class="right">--</td><td>--</td></tr>
-      <tr><td>Total verified</td><td class="right">13,553</td><td class="right">1,067</td><td class="right">--</td><td>0 errors</td></tr>
-      <tr><td>Startup time</td><td class="right">9s</td><td class="right">6s</td><td class="right">121s</td><td>15--20x</td></tr>
-      <tr><td>Binary size</td><td class="right" colspan="2">16 MB</td><td class="right">~500 MB</td><td>31x</td></tr>
-      <tr><td>CPU RSS</td><td class="right">--</td><td class="right">348 MB</td><td class="right">1,033 MB</td><td>3x</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<h3>5.5 Where the Speed Comes From</h3>
-<ol>
-  <li><strong>GPU-resident argmax:</strong> eliminates 74 MB DtoH transfer per step, saving ~3 ms at PCIe Gen4.</li>
-  <li><strong>CUDA graph replay:</strong> collapses N_layers x ~10 kernel launches into one <code>cuGraphLaunch</code>.</li>
-  <li><strong>Mixed prefill+decode batching:</strong> eliminates pipeline bubbles between phases.</li>
-  <li><strong>No GIL:</strong> scheduling, tokenisation, sampling run on parallel Rust threads via Rayon.</li>
-  <li><strong>No GC pauses:</strong> deterministic deallocation via Rust ownership.</li>
-  <li><strong>Zero-copy activation residency:</strong> all activations on GPU throughout the N-layer forward pass.</li>
-  <li><strong>Prefix caching:</strong> shared system prompts reuse computed KV blocks across requests.</li>
-</ol>
-
-<h3>5.6 CPU Component Benchmarks</h3>
-<div class="table-wrap">
-  <p class="table-caption">Table 4. CPU-side operations. Measured on Apple M5 (10 cores).</p>
-  <table>
-    <thead>
-      <tr><th>Operation</th><th class="right">Rust</th><th class="right">Python</th><th class="right">Speedup</th><th>Notes</th></tr>
-    </thead>
-    <tbody>
-      <tr><td>Combined penalties</td><td class="right">2.6 us</td><td class="right">63 us</td><td class="right">24x</td><td>Zero-alloc iteration</td></tr>
-      <tr><td>Repetition penalty (2K)</td><td class="right">3.1 us</td><td class="right">34 us</td><td class="right">11x</td><td>In-place mutation</td></tr>
-      <tr><td>Multinomial (32K vocab)</td><td class="right">12 us</td><td class="right">66 us</td><td class="right">5.5x</td><td>Cumulative sum + early exit</td></tr>
-      <tr><td>Top-p nucleus (128K)</td><td class="right">1.6 ms</td><td class="right">6.9 ms</td><td class="right">4.3x</td><td>Partial sort + threshold</td></tr>
-      <tr><td>Batch sampling (64 seqs)</td><td class="right">4.3 ms</td><td class="right">36.4 ms</td><td class="right">8.5x</td><td>Rayon across 10 cores</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<!-- 6. Development Cost -->
-<h2>6. Development Cost</h2>
-<div class="table-wrap">
-  <p class="table-caption">Table 5. Full development cost breakdown.</p>
-  <table>
-    <thead>
-      <tr><th>Category</th><th>Details</th><th class="right">Cost</th></tr>
-    </thead>
-    <tbody>
-      <tr><td>GPU compute</td><td>vast.ai A100 instances ($0.60--1.15/hr)</td><td class="right">$1,000</td></tr>
-      <tr><td>GPU compute</td><td>vast.ai B200 instances ($3.13--12.08/hr)</td><td class="right">$500</td></tr>
-      <tr><td>AI assistance</td><td>Claude Code extra usage</td><td class="right">$280</td></tr>
-      <tr class="highlight"><td><strong>Total</strong></td><td></td><td class="right"><strong>$1,780</strong></td></tr>
-    </tbody>
-  </table>
-</div>
-<p>
-  One developer working with Claude Code (Claude Opus) and rented GPUs over approximately
-  four weeks. The base Claude subscription covers most usage; the $280 reflects overage
-  charges for intensive multi-agent swarm sessions during the final performance push.
-</p>
-
-<!-- 7. Related Work -->
-<h2>7. Related Work</h2>
-<p><strong>vLLM</strong> -- PagedAttention and continuous batching for LLM serving. rvLLM reimplements the architecture in Rust, eliminating GIL, GC, PyTorch tensor overhead, and adding GPU-side sampling.</p>
-<p><strong>TensorRT-LLM</strong> -- NVIDIA's optimised inference with operator fusion and hardware-specific kernels. Requires model-specific compilation; tied to proprietary runtime. rvLLM targets simpler deployment (single binary).</p>
-<p><strong>llama.cpp</strong> -- Efficient C/C++ inference with extensive quantisation and broad hardware support. Excels at single-user local inference. rvLLM targets multi-tenant serving with continuous batching and OpenAI-compatible API.</p>
-<p><strong>candle</strong> -- Rust ML framework from Hugging Face. Provides tensor primitives; rvLLM implements the full serving stack on top of direct cuBLAS calls.</p>
-
-<!-- 8. Conclusion -->
-<h2>8. Conclusion</h2>
-<p>
-  rvLLM demonstrates that a systems-language reimplementation of LLM serving infrastructure
-  can achieve 16--20x higher throughput than the Python incumbent while using 3x less CPU memory,
-  starting 15--20x faster, and deploying as a 31x smaller binary. The system has been verified
-  with zero errors across 14,620 requests at batch sizes from N=1 to N=4,096 on both B200
-  and A100 GPUs, with coherent text output confirmed at every scale.
-</p>
-
-<!-- References -->
+<section>
 <h2>References</h2>
-<div class="references">
-  <ol>
-    <li>Kwon, W., Li, Z., et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <em>SOSP</em>, 2023.</li>
-    <li>Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." <em>ICLR</em>, 2024.</li>
-    <li>NVIDIA. "TensorRT-LLM." GitHub, 2024.</li>
-    <li>Gerganov, G. "llama.cpp: LLM inference in C/C++." GitHub, 2023.</li>
-    <li>Hugging Face. "candle: Minimalist ML framework for Rust." GitHub, 2023.</li>
-  </ol>
+<div class="refs">
+<ol>
+<li>Kwon et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." SOSP, 2023.</li>
+<li>Dao. "FlashAttention-2: Faster Attention with Better Parallelism." ICLR, 2024.</li>
+<li>NVIDIA. "TensorRT-LLM." 2024.</li>
+<li>Gerganov. "llama.cpp." 2023.</li>
+<li>Hugging Face. "candle: Minimalist ML framework for Rust." 2023.</li>
+</ol>
 </div>
+</section>
 
-<div class="paper-footer">
-  rvLLM -- Apache-2.0 -- <a href="https://github.com/m0at/rvllm" style="color:var(--fg-secondary)">github.com/m0at/rvllm</a>
+<footer>
+<p>rvLLM -- Apache-2.0 -- <a href="https://github.com/m0at/rvllm">github.com/m0at/rvllm</a></p>
+</footer>
+
 </div>
-
-</div>
-
-<script>
-(function() {
-  var root = document.documentElement;
-  var btns = document.querySelectorAll('.theme-btn');
-  var stored = localStorage.getItem('rvllm-theme') || 'bw';
-
-  function setTheme(t) {
-    root.className = t === 'bw' ? '' : t;
-    btns.forEach(function(b) { b.classList.toggle('active', b.dataset.theme === t); });
-    localStorage.setItem('rvllm-theme', t);
-  }
-
-  setTheme(stored);
-  btns.forEach(function(b) {
-    b.addEventListener('click', function(e) { e.stopPropagation(); setTheme(b.dataset.theme); });
-  });
-})();
-</script>
 </body>
 </html>

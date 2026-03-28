@@ -1,62 +1,3 @@
-\documentclass[11pt,a4paper]{article}
-
-% --- Page layout ---
-\usepackage[margin=1in]{geometry}
-\usepackage{parskip}
-
-% --- Fonts and encoding ---
-\usepackage[T1]{fontenc}
-\usepackage[utf8]{inputenc}
-\usepackage{lmodern}
-\usepackage{microtype}
-
-% --- Math ---
-\usepackage{amsmath,amssymb}
-
-% --- Graphics ---
-\usepackage{graphicx}
-\usepackage[table]{xcolor}
-
-% --- Tables ---
-\usepackage{booktabs}
-\usepackage{tabularx}
-\usepackage{multirow}
-
-% --- Code listings (black and white) ---
-\usepackage{listings}
-\lstset{
-  basicstyle=\ttfamily\small,
-  keywordstyle=\bfseries,
-  commentstyle=\itshape,
-  stringstyle=\ttfamily,
-  breaklines=true,
-  frame=single,
-  rulecolor=\color{gray!40},
-  numbers=left,
-  numberstyle=\tiny\color{gray},
-  xleftmargin=2em,
-  framexleftmargin=1.5em,
-  columns=flexible,
-  showstringspaces=false,
-}
-
-% --- Hyperlinks (black, no color) ---
-\usepackage[colorlinks=false,pdfborder={0 0 0}]{hyperref}
-
-% --- Bibliography ---
-\usepackage[numbers,sort&compress]{natbib}
-
-% --- Section styling (black) ---
-\usepackage{titlesec}
-\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
-\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
-
-% --- B&W table header helper ---
-\newcommand{\thead}[1]{\textbf{#1}}
-\definecolor{HeaderBlue}{HTML}{CCCCCC}
-
-% --- Document ---
-\begin{document}
 
 % --- Title block ---
 \begin{center}
@@ -225,22 +166,22 @@ implementing an \texttt{Architecture} trait.
   \small
   \begin{tabular}{@{}ll@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{Architecture} & \thead{Models} \\
+    \thead{Architecture} & \thead{Models} \\
     \midrule
     LlamaForCausalLM      & Llama~2/3, CodeLlama, Vicuna \\
-    \rowcolor{gray!8}
+    
     MistralForCausalLM     & Mistral~7B, Mistral Nemo \\
     Qwen2ForCausalLM       & Qwen2, Qwen2.5 \\
-    \rowcolor{gray!8}
+    
     PhiForCausalLM         & Phi-2, Phi-3, Phi-3.5 \\
     GemmaForCausalLM       & Gemma, Gemma~2 \\
-    \rowcolor{gray!8}
+    
     MixtralForCausalLM     & Mixtral 8x7B, 8x22B (MoE) \\
     DeepseekV2ForCausalLM  & DeepSeek-V2, DeepSeek-V2.5 (MoE) \\
-    \rowcolor{gray!8}
+    
     GPTNeoXForCausalLM     & Pythia, GPT-NeoX-20B \\
     StableLmForCausalLM    & StableLM-3B, StableLM-2 \\
-    \rowcolor{gray!8}
+    
     CohereForCausalLM      & Command-R, Command-R+ \\
     \bottomrule
   \end{tabular}
@@ -342,28 +283,28 @@ JIT compilation entirely.
   \small
   \begin{tabular}{@{}llp{4.8cm}@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{Kernel} & \thead{File} & \thead{Purpose} \\
+    \thead{Kernel} & \thead{File} & \thead{Purpose} \\
     \midrule
     PagedAttention V2   & \texttt{paged\_attention.cu}         & Block-table indirection, online softmax \\
-    \rowcolor{gray!8}
+    
     FlashAttention-2    & \texttt{flash\_attention.cu}          & Tiled prefill + decode with causal mask, paged KV \\
     RMSNorm (FP32)      & \texttt{rms\_norm.cu}                & Shared-memory parallel reduction \\
-    \rowcolor{gray!8}
+    
     RMSNorm (FP16)      & \texttt{rms\_norm\_f16.cu}            & Half-precision variant \\
     Fused Residual+Norm  & \texttt{fused\_residual\_rmsnorm.cu}  & Single-kernel residual add + normalise \\
-    \rowcolor{gray!8}
+    
     Rotary Embedding     & \texttt{rotary\_embedding.cu}         & RoPE with GQA support \\
     Activation (FP32)    & \texttt{activation.cu}               & SiLU, GELU, fused SiLU$\times$mul \\
-    \rowcolor{gray!8}
+    
     Activation (FP16)    & \texttt{activation\_f16.cu}           & Half-precision MLP activations \\
     Softmax              & \texttt{softmax.cu}                  & Warp-level numerically stable softmax \\
-    \rowcolor{gray!8}
+    
     \textbf{Argmax}      & \texttt{argmax.cu}                   & \textbf{GPU-side greedy sampling} \\
     Embedding Gather     & \texttt{embedding\_gather.cu}         & Token embedding table lookup \\
-    \rowcolor{gray!8}
+    
     Reshape and Cache    & \texttt{reshape\_and\_cache.cu}       & Scatter K/V into paged cache \\
     Block Copy           & \texttt{copy\_blocks.cu}              & KV block copy for beam search CoW \\
-    \rowcolor{gray!8}
+    
     Add Bias             & \texttt{add\_bias.cu}                & Fused bias addition for QKV \\
     FP8 KV               & \texttt{fp8\_kv.cu}                  & E4M3 quantisation/dequantisation \\
     \bottomrule
@@ -524,25 +465,25 @@ cache blocks.
   \small
   \begin{tabular}{@{}rrrrr@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{$N$} & \thead{Tokens} & \thead{Wall (ms)} & \thead{tok/s} & \thead{Errors} \\
+    \thead{$N$} & \thead{Tokens} & \thead{Wall (ms)} & \thead{tok/s} & \thead{Errors} \\
     \midrule
     1     & 32      & 279     & 114    & 0 \\
-    \rowcolor{gray!8}
+    
     4     & 128     & 762     & 167    & 0 \\
     8     & 256     & 601     & 425    & 0 \\
-    \rowcolor{gray!8}
+    
     16    & 512     & 826     & 619    & 0 \\
     32    & 1{,}024  & 1{,}346 & 760    & 0 \\
-    \rowcolor{gray!8}
+    
     64    & 2{,}048  & 798     & 2{,}566 & 0 \\
     128   & 4{,}096  & 1{,}249 & 3{,}279 & 0 \\
-    \rowcolor{gray!8}
+    
     256   & 8{,}192  & 2{,}106 & 3{,}889 & 0 \\
     512   & 16{,}384 & 4{,}179 & 3{,}920 & 0 \\
-    \rowcolor{gray!8}
+    
     \textbf{768} & \textbf{24{,}576} & \textbf{6{,}227} & \textbf{3{,}946} & \textbf{0} \\
     1{,}024 & 32{,}768 & 8{,}365 & 3{,}917 & 0 \\
-    \rowcolor{gray!8}
+    
     2{,}048 & 65{,}536 & 16{,}640 & 3{,}938 & 0 \\
     4{,}096 & 131{,}072 & 34{,}002 & 3{,}854 & 0 \\
     \bottomrule
@@ -565,22 +506,22 @@ Table~\ref{tab:a100} shows results on a single A100 SXM4 (40\,GB).
   \small
   \begin{tabular}{@{}rrrrrr@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{$N$} & \thead{Tokens} & \thead{Wall (ms)} & \thead{tok/s} & \thead{vs vLLM} & \thead{Errors} \\
+    \thead{$N$} & \thead{Tokens} & \thead{Wall (ms)} & \thead{tok/s} & \thead{vs vLLM} & \thead{Errors} \\
     \midrule
     1    & 32       & 731     & 43     & 0.2$\times$ & 0 \\
-    \rowcolor{gray!8}
+    
     4    & 128      & 561     & 228    & 1.1$\times$ & 0 \\
     8    & 256      & 681     & 375    & 1.9$\times$ & 0 \\
-    \rowcolor{gray!8}
+    
     16   & 512      & 901     & 568    & 2.8$\times$ & 0 \\
     32   & 1{,}024  & 1{,}286 & 796    & 4.0$\times$ & 0 \\
-    \rowcolor{gray!8}
+    
     48   & 1{,}536  & 752     & 2{,}042 & 10.2$\times$ & 0 \\
     64   & 2{,}048  & 824     & 2{,}485 & 12.4$\times$ & 0 \\
-    \rowcolor{gray!8}
+    
     96   & 3{,}072  & 1{,}181 & 2{,}601 & 13.0$\times$ & 0 \\
     128  & 4{,}096  & 1{,}368 & 2{,}994 & 15.0$\times$ & 0 \\
-    \rowcolor{gray!8}
+    
     256  & 8{,}192  & 2{,}570 & 3{,}187 & 15.9$\times$ & 0 \\
     \textbf{512} & \textbf{16{,}384} & \textbf{5{,}134} & \textbf{3{,}191} & \textbf{16.0$\times$} & \textbf{0} \\
     \bottomrule
@@ -622,16 +563,16 @@ empty responses, or token-0 degradation) were observed across any batch size.
   \small
   \begin{tabular}{@{}lrrrr@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{Metric} & \thead{rvLLM (B200)} & \thead{rvLLM (A100)} & \thead{Python vLLM} & \thead{Ratio} \\
+    \thead{Metric} & \thead{rvLLM (B200)} & \thead{rvLLM (A100)} & \thead{Python vLLM} & \thead{Ratio} \\
     \midrule
     Peak throughput    & 3{,}946 tok/s & 3{,}191 tok/s & 200 tok/s & 16--20$\times$ \\
-    \rowcolor{gray!8}
+    
     Max verified batch & $N\!=\!4{,}096$ & $N\!=\!512$ & --- & --- \\
     Total verified     & 13{,}553 & 1{,}067 & --- & 0 errors \\
-    \rowcolor{gray!8}
+    
     Startup time       & 9\,s    & 6\,s    & 121\,s  & 15--20$\times$ \\
     Binary size        & \multicolumn{2}{c}{16\,MB} & $\sim$500\,MB & 31$\times$ \\
-    \rowcolor{gray!8}
+    
     CPU RSS            & ---     & 348\,MB & 1{,}033\,MB & 3$\times$ \\
     \bottomrule
   \end{tabular}
@@ -649,13 +590,13 @@ between GPU forward passes, measured on Apple~M5 (10 cores, 24\,GB).
   \small
   \begin{tabular}{@{}lrrrp{3.2cm}@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{Operation} & \thead{Rust} & \thead{Python} & \thead{Speedup} & \thead{Notes} \\
+    \thead{Operation} & \thead{Rust} & \thead{Python} & \thead{Speedup} & \thead{Notes} \\
     \midrule
     Combined penalties      & 2.6\,$\mu$s  & 63\,$\mu$s  & 24$\times$  & Zero-alloc iteration \\
-    \rowcolor{gray!8}
+    
     Repetition penalty (2K) & 3.1\,$\mu$s  & 34\,$\mu$s  & 11$\times$  & In-place mutation \\
     Multinomial (32K vocab)  & 12\,$\mu$s   & 66\,$\mu$s  & 5.5$\times$ & Cumulative sum + early exit \\
-    \rowcolor{gray!8}
+    
     Top-$p$ nucleus (128K)  & 1.6\,ms      & 6.9\,ms     & 4.3$\times$ & Partial sort + threshold \\
     Batch sampling (64 seqs) & 4.3\,ms     & 36.4\,ms    & 8.5$\times$ & Rayon across 10 cores \\
     \bottomrule
@@ -720,14 +661,14 @@ for others considering similar systems-language rewrites.
   \small
   \begin{tabular}{@{}llr@{}}
     \toprule
-    \rowcolor{HeaderBlue} \thead{Category} & \thead{Details} & \thead{Cost} \\
+    \thead{Category} & \thead{Details} & \thead{Cost} \\
     \midrule
     GPU compute (vast.ai) & A100 instances (\$0.60--1.15/hr) & \$1{,}000 \\
-    \rowcolor{gray!8}
+    
     GPU compute (vast.ai) & B200 instances (\$3.13--12.08/hr) & \$500 \\
     AI assistance         & Claude Code extra usage & \$280 \\
     \midrule
-    \rowcolor{gray!8}
+    
     \textbf{Total}        &                         & \textbf{\$1{,}780} \\
     \bottomrule
   \end{tabular}
@@ -796,4 +737,3 @@ The project is open-source under the Apache-2.0 license.
 \bibliographystyle{plainnat}
 \bibliography{references}
 
-\end{document}

@@ -62,17 +62,17 @@
 \begin{center}
   {\LARGE\bfseries rvLLM: A High-Performance LLM Inference Engine in Rust\par}
   \vspace{0.6em}
-  {\large m0at\par}
+  {\large Andy Norris (m0at)\par}
   \vspace{0.3em}
   {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
   \vspace{0.3em}
-  {\normalsize March 2026\par}
+  {\normalsize San Francisco, March 28, 2026\par}
 \end{center}
 \vspace{1em}
 
 % --- Abstract ---
 \begin{abstract}
-We present rvLLM, a from-scratch Rust implementation of the vLLM inference engine
+I present rvLLM, a from-scratch Rust implementation of the vLLM inference engine
 for OpenAI-compatible API serving with CUDA GPU acceleration. The system comprises
 23~Rust crates and 15~pre-compiled CUDA PTX kernels, compiling to a single 16\,MB
 static binary. On a single NVIDIA B200 (180\,GB), rvLLM achieves 3{,}946~tok/s
@@ -492,7 +492,7 @@ synchronisation per decode step. A single B200 eliminates all of this.
 For bandwidth-bound decode, a single B200 at 8~TB/s memory bandwidth reads the
 full 140~GB of a 70B model in 17.5\,ms. With $N\!=\!64$ concurrent sequences,
 each 17.5\,ms window produces 64 tokens simultaneously $= 3{,}657$~tok/s---matching
-the theoretical peak we observe empirically at smaller model sizes.
+the theoretical peak observed empirically at smaller model sizes.
 
 % ============================================================================
 \section{Results}
@@ -710,7 +710,7 @@ super-linearly until the GPU saturates around $N\!=\!64$--$128$.
 \label{sec:cost}
 % ============================================================================
 
-We report the full cost of developing rvLLM from scratch, as a reference point
+I report the full cost of developing rvLLM from scratch, as a reference point
 for others considering similar systems-language rewrites.
 
 \begin{table}[h]
