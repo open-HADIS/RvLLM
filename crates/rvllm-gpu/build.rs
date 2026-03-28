@@ -5,6 +5,15 @@
 // and place outputs in OUT_DIR/ptx/. Downstream code can embed or
 // locate these PTX files via the RVLLM_PTX_DIR env var.
 //
+// Architecture selection:
+//   1. CUDA_ARCH env var -- single ("sm_90") or comma-separated ("sm_80,sm_90,sm_120")
+//   2. Auto-detect via `nvidia-smi --query-gpu=compute_cap --format=csv,noheader`
+//   3. Fallback to sm_80
+//
+// Supported architectures: sm_70 (Volta), sm_75 (Turing), sm_80/sm_86/sm_89 (Ampere),
+// sm_90/sm_90a (Hopper), sm_100/sm_100a (Blackwell data-center),
+// sm_120/sm_122 (Blackwell consumer).
+//
 // On Mac / CI without CUDA toolkit this is a silent no-op.
 
 use std::env;
@@ -29,8 +38,74 @@ fn find_nvcc() -> Option<PathBuf> {
     None
 }
 
+/// Map a compute capability string like "12.0" to an sm_ arch string.
+fn cc_to_sm(cc: &str) -> Option<&'static str> {
+    match cc.trim() {
+        "7.0" => Some("sm_70"),
+        "7.5" => Some("sm_75"),
+        "8.0" => Some("sm_80"),
+        "8.6" => Some("sm_86"),
+        "8.9" => Some("sm_89"),
+        "9.0" => Some("sm_90"),
+        "10.0" => Some("sm_100"),
+        "12.0" => Some("sm_120"),
+        "12.2" => Some("sm_122"),
+        _ => None,
+    }
+}
+
+/// Auto-detect GPU architectures via nvidia-smi.
+/// Returns a deduplicated list of sm_ strings for all installed GPUs.
+fn detect_gpu_archs() -> Vec<String> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut archs: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| cc_to_sm(line).map(String::from))
+        .collect();
+    archs.sort();
+    archs.dedup();
+    archs
+}
+
+/// Resolve the list of target architectures to compile for.
+fn resolve_archs() -> Vec<String> {
+    // Explicit env var takes priority (comma-separated)
+    if let Ok(val) = env::var("CUDA_ARCH") {
+        let archs: Vec<String> = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !archs.is_empty() {
+            return archs;
+        }
+    }
+
+    // Auto-detect from installed GPUs
+    let detected = detect_gpu_archs();
+    if !detected.is_empty() {
+        return detected;
+    }
+
+    // Fallback
+    vec!["sm_80".to_string()]
+}
+
 fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
-    let arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_80".to_string());
+    let archs = resolve_archs();
+    println!(
+        "cargo:warning=Target CUDA architectures: {}",
+        archs.join(", ")
+    );
 
     let ptx_dir = out_dir.join("ptx");
     fs::create_dir_all(&ptx_dir).expect("failed to create ptx output dir");
@@ -47,32 +122,44 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
         }
 
         let stem = path.file_stem().unwrap().to_str().unwrap();
-        let ptx_path = ptx_dir.join(format!("{}.ptx", stem));
-
         println!("cargo:rerun-if-changed={}", path.display());
 
-        let status = Command::new(nvcc)
-            .args(["-ptx", &format!("-arch={}", arch), "-O3", "-o"])
-            .arg(&ptx_path)
-            .arg(&path)
-            .status();
+        for arch in &archs {
+            // Multi-arch: suffix PTX with arch. Single-arch: keep original name.
+            let ptx_name = if archs.len() == 1 {
+                format!("{}.ptx", stem)
+            } else {
+                format!("{}_{}.ptx", stem, arch)
+            };
+            let ptx_path = ptx_dir.join(&ptx_name);
 
-        match status {
-            Ok(s) if s.success() => {
-                println!("cargo:warning=Compiled kernel: {}.cu -> {}.ptx", stem, stem);
-            }
-            Ok(s) => {
-                println!(
-                    "cargo:warning=nvcc failed for {}.cu (exit {}), skipping",
-                    stem,
-                    s.code().unwrap_or(-1)
-                );
-            }
-            Err(e) => {
-                println!(
-                    "cargo:warning=Failed to run nvcc for {}.cu: {}, skipping",
-                    stem, e
-                );
+            let status = Command::new(nvcc)
+                .args(["-ptx", &format!("-arch={}", arch), "-O3", "-o"])
+                .arg(&ptx_path)
+                .arg(&path)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    println!(
+                        "cargo:warning=Compiled kernel: {}.cu -> {} ({})",
+                        stem, ptx_name, arch
+                    );
+                }
+                Ok(s) => {
+                    println!(
+                        "cargo:warning=nvcc failed for {}.cu [{}] (exit {}), skipping",
+                        stem,
+                        arch,
+                        s.code().unwrap_or(-1)
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
+                        stem, arch, e
+                    );
+                }
             }
         }
     }

@@ -24,6 +24,8 @@ cd "$DIR"
 # sm_89  = RTX 4090, L40S
 # sm_90  = H100, H200
 # sm_100 = B100, B200
+# sm_120 = RTX 5090, RTX 6000 Blackwell
+# sm_122 = RTX 5080, RTX 5070
 ALL_ARCHS="sm_70 sm_75 sm_80 sm_86 sm_89 sm_90"
 
 # Check nvcc version for sm_100 support (CUDA 12.8+)
@@ -32,6 +34,11 @@ NVCC_MAJOR=$(echo "$NVCC_VERSION" | cut -d. -f1)
 NVCC_MINOR=$(echo "$NVCC_VERSION" | cut -d. -f2)
 if [ "$NVCC_MAJOR" -ge 13 ] || ([ "$NVCC_MAJOR" -eq 12 ] && [ "$NVCC_MINOR" -ge 8 ]); then
     ALL_ARCHS="$ALL_ARCHS sm_100"
+fi
+
+# Check nvcc version for sm_120/sm_122 support (CUDA 13.0+)
+if [ "$NVCC_MAJOR" -ge 13 ]; then
+    ALL_ARCHS="$ALL_ARCHS sm_120 sm_122"
 fi
 
 # Use specific arch if provided

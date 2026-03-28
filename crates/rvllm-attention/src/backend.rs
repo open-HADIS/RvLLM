@@ -78,6 +78,18 @@ mod tests {
     }
 
     #[test]
+    fn select_flash_for_sm120_blackwell() {
+        let backend = select_backend((12, 0));
+        assert_eq!(backend.name(), "FlashAttention2-CPU");
+    }
+
+    #[test]
+    fn select_flash_for_sm122_blackwell() {
+        let backend = select_backend((12, 2));
+        assert_eq!(backend.name(), "FlashAttention2-CPU");
+    }
+
+    #[test]
     fn select_paged_for_sm75() {
         let backend = select_backend((7, 5));
         assert_eq!(backend.name(), "PagedAttentionV2");

@@ -306,6 +306,8 @@ mod tests {
     fn dtype_resolve() {
         assert_eq!(Dtype::Auto.resolve(7), Dtype::Float16);
         assert_eq!(Dtype::Auto.resolve(8), Dtype::Float16);
+        assert_eq!(Dtype::Auto.resolve(9), Dtype::Float16);
+        assert_eq!(Dtype::Auto.resolve(12), Dtype::Float16); // Blackwell sm_120/sm_122
         assert_eq!(Dtype::Auto.resolve(6), Dtype::Float32);
         assert_eq!(Dtype::Float32.resolve(8), Dtype::Float32);
     }

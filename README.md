@@ -106,6 +106,8 @@ Operations that run on CPU between GPU forward passes. Measured on both Apple M5
 | sm_89 | RTX 4090, L40S | Supported |
 | sm_90 | **H100**, H200 | Supported |
 | sm_100 | **B100**, **B200** | Supported (requires CUDA 12.8+) |
+| sm_120 | **RTX 5090**, RTX 6000 Blackwell | Supported (requires CUDA 13.0+) |
+| sm_122 | RTX 5080, RTX 5070 | Supported (requires CUDA 13.0+) |
 
 Kernels are compiled to PTX for all architectures by default (`cd kernels && bash build.sh`). To build for a specific GPU:
 ```bash
