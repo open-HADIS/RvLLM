@@ -675,7 +675,15 @@ mod inner {
         pub fn step(&mut self) -> Result<Vec<RequestOutput>> {
             // Drain any buffered requests from the shared queue before scheduling
             self.drain_request_queue();
-            self.step_with_overlap(|| {})
+            let t0 = std::time::Instant::now();
+            let result = self.step_with_overlap(|| {});
+            if std::env::var("RVLLM_PROFILE").is_ok() {
+                let el = t0.elapsed();
+                if el.as_millis() > 0 {
+                    tracing::info!("PROFILE step total: {:.3}ms", el.as_secs_f64() * 1000.0);
+                }
+            }
+            result
         }
 
         pub fn step_old(&mut self) -> Result<Vec<RequestOutput>> {
