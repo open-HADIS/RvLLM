@@ -679,12 +679,6 @@ impl GpuWorker {
                 if let Err(e) = runner.fuse_weights() {
                     warn!("weight fusion failed: {e} -- falling back to f32 forward path");
                     runner.disable_fp16();
-                } else {
-                    // fuse_weights succeeded -- f16 forward is active.
-                    // Drop the f32 weight clone from the runner to free ~3GB GPU memory.
-                    // The f16 path doesn't need f32 weights at runtime.
-                    runner.drop_f32_weights();
-                    info!("dropped f32 weight clone to free GPU memory");
                 }
             }
 
