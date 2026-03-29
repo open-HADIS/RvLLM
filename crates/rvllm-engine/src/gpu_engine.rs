@@ -287,6 +287,10 @@ mod inner {
     /// new requests here; the GPU engine drains them during GPU wait.
     pub type RequestQueue = std::sync::Arc<std::sync::Mutex<Vec<PendingRequest>>>;
 
+    /// Shared abort queue. The async engine pushes request IDs to abort
+    /// here; the GPU engine drains them at the start of each step.
+    pub type AbortQueue = std::sync::Arc<std::sync::Mutex<Vec<RequestId>>>;
+
     /// A request buffered for async processing.
     pub struct PendingRequest {
         pub request_id: RequestId,
@@ -300,7 +304,7 @@ mod inner {
         worker: GpuWorker,
         tokenizer: Tokenizer,
         requests: HashMap<RequestId, EngineRequest>,
-        next_request_id: AtomicU64,
+        next_request_id: std::sync::Arc<AtomicU64>,
         next_seq_id: u64,
         prefix_cache: Option<PrefixCache>,
         /// Total number of GPU KV-cache blocks available.
@@ -313,6 +317,8 @@ mod inner {
         seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
         /// Shared queue for new requests arriving during GPU compute.
         request_queue: Option<RequestQueue>,
+        /// Shared queue for abort requests arriving during GPU compute.
+        abort_queue: Option<AbortQueue>,
     }
 
     /// Pending state from step_launch, consumed by step_collect.
@@ -423,7 +429,7 @@ mod inner {
                 worker,
                 tokenizer,
                 requests: HashMap::new(),
-                next_request_id: AtomicU64::new(1),
+                next_request_id: std::sync::Arc::new(AtomicU64::new(1)),
                 next_seq_id: 0,
                 prefix_cache,
                 num_gpu_blocks: num_gpu_blocks as u32,
@@ -431,6 +437,7 @@ mod inner {
                 free_blocks: Vec::new(),
                 seq_block_tables: HashMap::new(),
                 request_queue: None,
+                abort_queue: None,
             })
         }
 
@@ -586,8 +593,22 @@ mod inner {
             self.request_queue = Some(q);
         }
 
-        /// Drain buffered requests from the shared queue into the engine.
+        /// Set the shared abort queue for async overlap.
+        pub fn set_abort_queue(&mut self, q: AbortQueue) {
+            self.abort_queue = Some(q);
+        }
+
+        /// Drain buffered requests and aborts from shared queues into the engine.
         fn drain_request_queue(&mut self) {
+            if let Some(ref q) = self.abort_queue {
+                let aborts: Vec<RequestId> = {
+                    let mut lock = q.lock().unwrap();
+                    std::mem::take(&mut *lock)
+                };
+                for rid in aborts {
+                    self.abort_request(&rid);
+                }
+            }
             if let Some(ref q) = self.request_queue {
                 let requests: Vec<PendingRequest> = {
                     let mut lock = q.lock().unwrap();
@@ -951,6 +972,11 @@ mod inner {
             &self.config
         }
 
+        /// Get a shared handle to the request ID counter (for async-side ID assignment).
+        pub fn request_id_counter(&self) -> std::sync::Arc<AtomicU64> {
+            self.next_request_id.clone()
+        }
+
         /// Build per-group metadata with block allocation.  Returns the
         /// metadata list plus a set of sequence IDs that were aborted because
         /// blocks could not be allocated.
@@ -1046,4 +1072,4 @@ mod inner {
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::GpuLLMEngine;
+pub use inner::{AbortQueue, GpuLLMEngine, PendingRequest, RequestQueue};
