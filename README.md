@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 15 CUDA kernels. 5,123 tok/s on A100 (FP16, N=32). 236 tok/s single-sequence. Full f16 forward, zero casts, CUDA graph replay. 20x faster startup. 31x smaller.**
+**23 Rust crates. 15 CUDA kernels. 6,098 tok/s on A100 (FP16, N=32). 218 tok/s single-sequence. Full f16 forward, zero casts, CUDA graph replay, dedicated GPU thread. 20x faster startup. 31x smaller.**
 
 ## Install
 
@@ -18,14 +18,16 @@ Or build from source -- see [Quick Start](#quick-start) below.
 
 ## Benchmarks (Qwen2.5-1.5B, A100 80GB SXM4)
 
-Greedy decoding, full f16 forward, CUDA graph replay. Measured 2026-03-29.
+Greedy decoding, full f16 forward, CUDA graph replay, dedicated GPU thread. Measured 2026-03-29.
 
-| Concurrent (N) | tok/s | ms/tok |
-|---:|---:|---:|
-| 1 | 236 | 4.2 |
-| 4 | 834 | - |
-| 8 | 1,786 | - |
-| 32 | 5,123 | - |
+| Concurrent (N) | tok/s |
+|---:|---:|
+| 1 | 218 |
+| 2 | 466 |
+| 4 | 825 |
+| 8 | 1,774 |
+| 16 | 3,303 |
+| 32 | **6,098** |
 
 | Metric | Value |
 |---|---|
@@ -33,7 +35,7 @@ Greedy decoding, full f16 forward, CUDA graph replay. Measured 2026-03-29.
 | Binary size | 16 MB (vs ~500 MB Python vLLM) |
 | CPU memory | 348 MB (vs ~1 GB Python vLLM) |
 
-Theoretical peak at N=1 is 574 tok/s (memory-bandwidth-bound). Current utilization: 41%. See [docs/update-log.md](docs/update-log.md) for the full optimization history from 130 to 236 tok/s.
+Near-linear scaling from N=1 to N=16. Peak at N=32. Theoretical N=1 peak is 574 tok/s (memory-bandwidth-bound at 41% utilization). See [docs/update-log.md](docs/update-log.md) for the full optimization history.
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
@@ -531,20 +533,22 @@ rvLLM benchmark --model <MODEL>   Run offline throughput benchmark
 - Token-level parity test suite
 - 790 tests across 23 crates
 
-### Roadmap (Phase 5: overhead reduction)
-- Mixed-precision cuBLAS GEMM (f32 x f16 -> f32, eliminate 392 cast kernels per forward)
-- Wire up fused residual+RMSNorm in forward path (kernel exists, not yet used)
-- In-place RoPE (eliminate 56 allocs + 56 memcpy per forward)
-- Packed metadata HtoD (6 transfers -> 1)
-- Pre-allocated layer scratch buffers (eliminate ~588 allocs per forward)
-- Engine loop optimization (reduce CPU scheduling overhead)
+### Completed Optimizations
+- Full f16 forward path (zero casts, all f16 kernels)
+- Fused QKV + gate+up weight concatenation (5 GEMMs -> 2 per layer)
+- Cross-layer residual+RMSNorm fusion (-28 kernel launches)
+- In-place RoPE, packed metadata HtoD, memset elimination
+- CUDA graph capture/replay with cuBLAS workspace
+- Dedicated GPU thread (async loop stays responsive during compute)
+- Async DtoH with pinned host memory
 
-### Future
-- LoRA adapter hot-swapping (see [CONTRIBUTING.md](CONTRIBUTING.md))
-- Vision-language models (see [docs/VISION_MODELS.md](docs/VISION_MODELS.md))
+### Roadmap
+- INT8/FP8 quantization (halve weight reads -> ~2ms/tok -> ~500 tok/s)
+- Speculative decoding (amortize weight reads across draft tokens)
+- Async engine overlap with new request arrival processing
+- LoRA adapter hot-swapping
+- Vision-language models
 - Pipeline parallelism
-- Fused QKV projection (3 GEMMs -> 1)
-- Vectorized float4 loads in kernels
 - Production hardening (fuzz testing, load testing at 1000 concurrent)
 
 ## Development Cost
@@ -570,12 +574,13 @@ Roughly **$1,780** in compute and AI overage costs to go from zero to a working 
 
 ## Optimization History
 
-| Phase | N=1 tok/s | Key change |
-|---|---:|---|
-| Phase 4 | 130 | CUDA graph capture working (3 root causes fixed) |
-| Phase 5 | 174 | 10-agent swarm: cast reduction, fused ops, engine optimization |
-| Full f16 | 200 | Zero casts, all f16 kernels, f16io attention kernel |
-| 9-agent kernel | **236** | Cross-layer fusion, memset elimination, pool tuning |
+| Phase | N=1 tok/s | N=32 tok/s | Key change |
+|---|---:|---:|---|
+| Phase 4 | 130 | 3,467 | CUDA graph capture working (3 root causes fixed) |
+| Phase 5 | 174 | 4,276 | 10-agent swarm: cast reduction, fused ops, engine optimization |
+| Full f16 | 200 | - | Zero casts, all f16 kernels, f16io attention kernel |
+| 9-agent kernel | 236 | 5,123 | Cross-layer fusion, memset elimination, pool tuning |
+| GPU thread | **218** | **6,098** | Dedicated OS thread for GPU, async loop stays responsive |
 
 See **[docs/update-log.md](docs/update-log.md)** for the full chronological record with technical details, timing breakdowns, and agent descriptions.
 

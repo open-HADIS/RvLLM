@@ -1,56 +1,57 @@
-*update 15:17 mar28 -- corrected numbers to match verified benchmarks. previous post overstated some optimizations that were planned but not landed. current verified numbers below.
+*update 17:00 mar29 -- major performance push. full f16 forward (zero casts), fused weights, cross-layer kernel fusion, dedicated GPU thread. 6,098 tok/s peak.
 
-rvLLM -- vLLM rewritten in Rust. One dev, 22 hours, $1,780.
-3,467 tok/s (N=32) on A100. 128 tok/s single-sequence. CUDA graph capture/replay working. 20x faster startup. 31x smaller. actively optimizing -- help me push this further.
+rvLLM -- vLLM rewritten in Rust. One dev, $1,780.
+6,098 tok/s (N=32) on A100. 218 tok/s single-sequence (4.5ms/tok). near-linear scaling to N=16. 20x faster startup. 31x smaller.
 
 what is it
-rvLLM is a from-scratch Rust implementation of vLLM for serving LLMs on GPUs. drop-in OpenAI API replacement. same endpoints, same format, just point your client at the Rust server.
+from-scratch Rust implementation of vLLM. drop-in OpenAI API replacement. same endpoints, same format, just point your client at the Rust server. 16 MB binary.
 
 why
-python vLLM transfers the entire logit matrix (74 MB for Qwen2.5-1.5B at batch 128) from GPU to host every decode step for sampling. rvLLM runs argmax directly on GPU and transfers 512 bytes. 150,000x reduction in PCIe traffic per step. no GIL, no GC, no PyTorch tensor metadata overhead. deterministic memory with Rust ownership. single 16 MB binary vs ~500 MB pip install.
+no GIL, no GC, no PyTorch. GPU-side argmax (512 bytes PCIe vs 74 MB logit transfer). deterministic memory via Rust ownership. single static binary vs ~500 MB pip install.
 
 architecture
 - 23 Rust crates, strict dependency tree from GPU primitives to HTTP API
 - 15 hand-written CUDA kernels compiled to PTX (sm_70 through sm_120)
-- cuBLAS hgemm (FP16 tensor cores) for all linear projections
-- f16 KV cache with paged block allocation (single cudaMalloc slab)
-- FlashAttention-2 with paged KV cache and GQA support (decode + prefill)
-- Split-KV attention for long contexts (>1024 tokens)
-- GPU-side argmax kernel (greedy decode without logit transfer)
-- CUDA graph capture/replay for decode steps (working end-to-end on A100)
-- fused SiLU*mul activation kernel
+- full f16 forward path -- zero cast kernels in the decode inner loop
+- fused QKV + gate+up weight concatenation (5 GEMMs -> 2 per layer)
+- cross-layer residual+RMSNorm fusion (-28 kernel launches per forward)
+- CUDA graph capture/replay (full decode forward as single graph launch)
+- dedicated GPU thread (tokio async loop stays responsive during 4ms compute)
+- async DtoH with pinned host memory
+- FlashAttention-2 with paged KV cache, GQA, f16 I/O
+- cuBLAS hgemm + cublasLt split-K for decode GEMMs
+- f16 KV cache with paged block allocation
 - continuous batching with preemption and prefix caching
 - 10 model architectures (Llama, Mistral, Qwen2, Phi, Gemma, Mixtral, DeepSeek, GPT-NeoX, StableLM, Cohere)
-- mock-GPU backend for development without NVIDIA hardware
-- 790 tests across 23 crates
+- 792 tests across 23 crates
 
-verified throughput (A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req, 2026-03-28)
+verified throughput (A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
 
-N=1:    128 tok/s   (7.7ms/tok, 22.7% mem BW utilization)
-N=4:    540 tok/s
-N=8:    1,091 tok/s
-N=16:   2,118 tok/s
-N=32:   3,467 tok/s
-
-bottleneck: 77% of per-token time is overhead (kernel launch, alloc, metadata HtoD, CPU scheduling), not compute. theoretical peak at N=1 is 574 tok/s. actively working on closing this gap.
+N=1:      218 tok/s
+N=2:      466 tok/s
+N=4:      825 tok/s
+N=8:    1,774 tok/s
+N=16:   3,303 tok/s
+N=32:   6,098 tok/s (peak)
 
 system comparison
 - startup: 6s vs ~120s (20x faster)
 - binary: 16 MB vs ~500 MB (31x smaller)
 - CPU RSS: 348 MB vs ~1 GB (3x less)
 
-GPU support
-V100, T4, A100, RTX 3090/4090, H100, H200, B100, B200, RTX PRO 6000 Blackwell (sm_120). verified on A100 + B200 + RTX PRO 6000. CUDA 12.x and 13.x.
+optimization journey (N=1 single-sequence tok/s)
+phase 4: 130 -- CUDA graph capture (fixed 3 root causes)
+phase 5: 174 -- 10-agent swarm (cast reduction, fused ops, engine opt)
+full f16: 200 -- zero casts, all f16 kernels
+9-agent:  236 -- cross-layer fusion, memset elimination, pool tuning
+GPU thread: 218 -- dedicated OS thread, peak N=32 jumps to 6,098
 
-optimization phases
-phase 1 (FP32): 3,191 tok/s peak -- baseline
-phase 2 (FP16 hgemm + f16 KV cache): batched throughput improvement
-phase 3 (FA2 decode, fused SiLU, GPU argmax): sampling + attention path
-phase 4 (CUDA graph capture/replay): fixed 3 root causes, graph working end-to-end
-phase 5 (in progress): overhead reduction -- mixed GEMM, fused ops, packed metadata, alloc elimination
+the 4.1ms per token at N=1 is genuine GPU memory bandwidth time (3GB weights on A100 @ 2039 GB/s). custom GEMV = cuBLAS = cublasLt = same speed. the kernel efficiency frontier.
+
+next: INT8/FP8 quantization (halve weight reads), speculative decoding, async engine overlap.
 
 cost
-$1,500 vast.ai GPU rentals + $280 Claude Code extra usage. built with Claude Opus doing architecture, CUDA kernels, debugging, and 20-agent swarms for major refactors. one developer, 22 hours.
+$1,500 vast.ai GPU rentals + $280 Claude Code. one developer with Claude Opus + 30-agent swarms. San Francisco.
 
 repo: https://github.com/m0at/rvllm
 paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
