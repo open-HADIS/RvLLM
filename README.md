@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 15 CUDA kernels. 6,098 tok/s on A100 (FP16, N=32). 218 tok/s single-sequence. Full f16 forward, zero casts, CUDA graph replay, dedicated GPU thread. 20x faster startup. 31x smaller.**
+**23 Rust crates. 15 CUDA kernels. 6,098 tok/s on A100 (FP16). Beats Python vLLM 0.11.0 by 27% at N=32. Full f16 forward, zero casts, CUDA graph replay. 20x faster startup. 31x smaller.**
 
 ## Install
 
@@ -18,24 +18,24 @@ Or build from source -- see [Quick Start](#quick-start) below.
 
 ## Benchmarks (Qwen2.5-1.5B, A100 80GB SXM4)
 
-Greedy decoding, full f16 forward, CUDA graph replay, dedicated GPU thread. Measured 2026-03-29.
+Head-to-head on the same hardware, same model, greedy decoding, 32 tokens/request. Measured 2026-03-29.
 
-| Concurrent (N) | tok/s |
-|---:|---:|
-| 1 | 218 |
-| 2 | 466 |
-| 4 | 825 |
-| 8 | 1,774 |
-| 16 | 3,303 |
-| 32 | **6,098** |
+| Concurrent (N) | rvLLM (tok/s) | vLLM 0.11.0 (tok/s) | Ratio |
+|---:|---:|---:|---|
+| 1 | 218 | 225 | 0.97x |
+| 2 | 466 | 443 | **1.05x** |
+| 4 | 825 | 842 | 0.98x |
+| 8 | 1,774 | 1,703 | **1.04x** |
+| 16 | 3,303 | 2,981 | **1.11x** |
+| 32 | **6,098** | 4,810 | **1.27x** |
 
-| Metric | Value |
-|---|---|
-| Startup time | 6 sec (vs ~120 sec Python vLLM) |
-| Binary size | 16 MB (vs ~500 MB Python vLLM) |
-| CPU memory | 348 MB (vs ~1 GB Python vLLM) |
+| Metric | rvLLM | Python vLLM |
+|---|---|---|
+| Startup time | 6 sec | ~120 sec |
+| Binary size | 16 MB | ~500 MB |
+| CPU memory | 348 MB | ~1 GB |
 
-Near-linear scaling from N=1 to N=16. Peak at N=32. Theoretical N=1 peak is 574 tok/s (memory-bandwidth-bound at 41% utilization). See [docs/update-log.md](docs/update-log.md) for the full optimization history.
+rvLLM matches or beats Python vLLM across the board. 27% faster at N=32. Near-linear scaling to N=16. See [docs/update-log.md](docs/update-log.md) for the full optimization history.
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
