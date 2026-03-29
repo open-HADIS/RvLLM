@@ -337,67 +337,113 @@ mod inner {
             let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, num_tokens, hidden, q_dim, &self.loader)?;
             if dbg { dbg_dump("o_proj", &attn_proj, &self.stream); }
 
-            // 8. Fused residual + post-attention RMSNorm f16
-            let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
-                &self.stream, &self.loader,
-                residual_ref, &attn_proj, post_norm_w,
-                cfg.rms_norm_eps, num_tokens, hidden,
-            )?;
-
-            // 9-10. MLP: gate+up -> silu*mul -> down projection
-            let mlp_out = if num_tokens == 1 {
-                // T=1: try fused silu+down kernel (eliminates intermediate buffer + 1 launch)
-                if let Some(fused_gate_up) = weights.fused_gate_up {
-                    let gate_up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up, num_tokens, intermediate * 2, hidden, &self.loader)?;
-                    let gate = gate_up.slice(..intermediate);
-                    let up = gate_up.slice(intermediate..intermediate * 2);
-                    // Fused silu+down GEMV: saves 1 launch but custom GEMV can't
-                    // beat cuBLAS for large intermediate_size. Disabled pending profiling.
-                    if let Ok(kernel) = self.loader.get_func("_disabled_fused_silu_down", "fused_silu_down_f16_kernel") {
-                        let mut out = unsafe { self.stream.alloc::<f16>(hidden) }
-                            .map_err(|e| LLMError::GpuError(format!("fused_silu_down alloc: {e}")))?;
-                        let smem = (256 / 32) * std::mem::size_of::<f32>();
-                        let cfg = LaunchConfig {
-                            grid_dim: (hidden as u32, 1, 1),
+            // 8-10. Post-attention: residual add + norm + MLP
+            // For T=1 decode: try CuTE fused kernels that eliminate intermediate buffers.
+            // For T>1 prefill: use separate kernels (cuBLAS GEMM is faster).
+            let (residual, mlp_out) = if num_tokens == 1 {
+                // Try fused add+norm+gateup GEMV (3-way: saves 3 launches + 2 buffers)
+                let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup", "fused_cute_add_norm_gateup_gemv").ok();
+                if let Some(ref fk) = fused_gateup_ok {
+                    let gate_up_dim = intermediate * 2;
+                    let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("fused gateup alloc: {e}")))?;
+                    let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                        .map_err(|e| LLMError::GpuError(format!("fused residual alloc: {e}")))?;
+                    let smem = (hidden * std::mem::size_of::<f32>() + 8 * std::mem::size_of::<f32>()) as u32;
+                    let fused_gate_up_w = weights.fused_gate_up.unwrap_or(weights.gate_proj);
+                    // Warp-per-row: 8 warps = 8 rows per block
+                    let rows_per_block = 8u32;
+                    let launch_cfg = LaunchConfig {
+                        grid_dim: (((gate_up_dim as u32) + rows_per_block - 1) / rows_per_block, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    };
+                    if smem > 49152 {
+                        fk.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem as i32,
+                        ).map_err(|e| LLMError::GpuError(format!("fused smem attr: {e}")))?;
+                    }
+                    unsafe {
+                        self.stream.launch_builder(fk)
+                            .arg(&mut gate_up_out)
+                            .arg(&mut residual_out)
+                            .arg(residual_ref)
+                            .arg(&attn_proj)
+                            .arg(post_norm_w)
+                            .arg(fused_gate_up_w)
+                            .arg(&cfg.rms_norm_eps)
+                            .arg(&(hidden as i32))
+                            .arg(&(gate_up_dim as i32))
+                            .launch(launch_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("fused add_norm_gateup launch: {e}")))?;
+                    }
+                    // Now do silu*mul + down
+                    let gate = gate_up_out.slice(..intermediate);
+                    let up = gate_up_out.slice(intermediate..gate_up_dim);
+                    // Try fused silu+down GEMV
+                    let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down", "fused_cute_silu_down_gemv") {
+                        let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                            .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
+                        let sk_smem = (8 * std::mem::size_of::<f32>()) as u32;
+                        let sk_cfg = LaunchConfig {
+                            grid_dim: (((hidden as u32) + 7) / 8, 1, 1),
                             block_dim: (256, 1, 1),
-                            shared_mem_bytes: smem as u32,
+                            shared_mem_bytes: sk_smem,
                         };
                         unsafe {
-                            self.stream.launch_builder(&kernel)
-                                .arg(&mut out)
+                            self.stream.launch_builder(sk)
+                                .arg(&mut down_out)
                                 .arg(&gate).arg(&up)
                                 .arg(weights.down_proj)
                                 .arg(&(hidden as i32))
                                 .arg(&(intermediate as i32))
-                                .launch(cfg)
-                                .map_err(|e| LLMError::GpuError(format!("fused_silu_down launch: {e}")))?;
+                                .launch(sk_cfg)
+                                .map_err(|e| LLMError::GpuError(format!("fused silu_down launch: {e}")))?;
                         }
-                        out
+                        down_out
                     } else {
-                        // Fallback: separate silu + down
-                        let n = intermediate;
-                        let fused = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, n)?;
-                        Self::hgemm_dispatch(&self.stream, blas, lt, &fused, weights.down_proj, 1, hidden, intermediate, &self.loader)?
-                    }
+                        let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
+                        Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                    };
+                    (residual_out, mlp)
                 } else {
-                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
-                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
-                    let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, intermediate)?;
-                    Self::hgemm_dispatch(&self.stream, blas, lt, &fused, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                    // Fallback: separate add+norm then separate gate+up GEMV
+                    let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
+                        &self.stream, &self.loader,
+                        residual_ref, &attn_proj, post_norm_w,
+                        cfg.rms_norm_eps, num_tokens, hidden,
+                    )?;
+                    let gate_up = if let Some(fguw) = weights.fused_gate_up {
+                        Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
+                    } else {
+                        let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
+                        let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
+                        // concat into one buffer
+                        let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
+                            .map_err(|e| LLMError::GpuError(format!("gate_up concat: {e}")))?;
+                        self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate))
+                            .map_err(|e| LLMError::GpuError(format!("gate copy: {e}")))?;
+                        self.stream.memcpy_dtod(&u, &mut buf.slice_mut(intermediate..))
+                            .map_err(|e| LLMError::GpuError(format!("up copy: {e}")))?;
+                        buf
+                    };
+                    let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
+                    let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
+                    (residual, mlp)
                 }
             } else {
-                // T>1: use separate kernels (cuBLAS GEMMs)
-                let (gate, up) = if let Some(fused_gate_up) = weights.fused_gate_up {
-                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    (gate, up)
-                } else {
-                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    (gate, up)
-                };
-                let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
-                Self::hgemm_dispatch(&self.stream, blas, lt, &fused, weights.down_proj, num_tokens, hidden, intermediate, &self.loader)?
+                // T>1: separate kernels
+                let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
+                    &self.stream, &self.loader,
+                    residual_ref, &attn_proj, post_norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden,
+                )?;
+                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                let fused_act = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
+                let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, num_tokens, hidden, intermediate, &self.loader)?;
+                (residual, mlp)
             };
 
             // 11. Return (residual, mlp_out) -- the add is fused into the NEXT layer's norm
