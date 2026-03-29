@@ -1184,22 +1184,34 @@ impl GpuWorker {
             LLMError::GpuError("GPU model runner not initialized".into())
         })?;
 
-        // Upload padded metadata (runner handles padding internally)
-        runner.upload_metadata_padded(
-            &model_input.token_ids,
-            &model_input.position_ids,
-            &model_input.attention_metadata,
-            padded_batch,
-        )?;
+        // Upload metadata (skip clone when no padding needed)
+        if actual_batch == padded_batch {
+            runner.upload_metadata(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+            )?;
+        } else {
+            runner.upload_metadata_padded(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                padded_batch,
+            )?;
+        }
 
         let graph = self.graph_runner.pool().get_exact(padded_batch).ok_or_else(|| {
             LLMError::GpuError(format!("no graph for padded batch {padded_batch}"))
         })?;
         graph.replay(&self.compute_stream)?;
 
-        // Read only actual_batch results (ignore padding)
+        // Read results -- skip trim when no padding
         let ids = runner.read_graph_output(padded_batch)?;
-        Ok(ForwardOutput::TokenIds(ids[..actual_batch].to_vec()))
+        if actual_batch == padded_batch {
+            Ok(ForwardOutput::TokenIds(ids))
+        } else {
+            Ok(ForwardOutput::TokenIds(ids[..actual_batch].to_vec()))
+        }
     }
 
     /// Try to capture a graph for a padded batch size.
