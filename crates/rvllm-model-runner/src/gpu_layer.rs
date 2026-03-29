@@ -473,23 +473,14 @@ mod inner {
 
             // 6. Attention
             let attn_out = if input.is_prefill {
-                // Prefill uses f32 Q kernel (prefill is one-shot, not perf-critical)
-                // Fall back to f32 path for prefill: cast Q f16->f32, run f32 prefill, cast back
-                let cast_f16_f32 = self.loader.get_func("cast_fp", "cast_f16_to_f32_kernel")
-                    .map_err(|e| LLMError::GpuError(format!("load cast f16->f32: {e}")))?;
-                let cast_f32_f16 = self.loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
-                    .map_err(|e| LLMError::GpuError(format!("load cast f32->f16: {e}")))?;
-                let q_f16 = qkv.slice(..q_end);
-                let q_f32 = Self::cast_f16_to_f32(&self.stream, &q_f16, q_end, &cast_f16_f32)?;
-                let attn_f32 = Self::prefill_attention(
+                Self::prefill_attention_f16io(
                     &self.stream, &self.loader,
-                    &q_f32.as_view(),
+                    &qkv.slice(..q_end),
                     input.key_cache, input.value_cache,
                     &input.block_tables, &input.context_lens, &input.seq_start_pos,
                     num_tokens, input.num_seqs, num_heads, num_kv_heads, head_dim,
                     input.max_context_len, input.block_size,
-                )?;
-                Self::cast_f32_to_f16(&self.stream, &attn_f32, num_tokens * num_heads * head_dim, &cast_f32_f16)?
+                )?
             } else {
                 Self::decode_attention_f16io(
                     &self.stream, &self.loader,
@@ -853,6 +844,82 @@ mod inner {
                     .arg(&1i32) // causal
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("prefill FA2 launch: {e}")))?;
+            }
+
+            Ok(output)
+        }
+
+        /// FA3 prefill attention with f16 I/O: f16 Q, f16 KV cache, f16 output.
+        /// Eliminates the f32 cast round-trip from the prefill path.
+        #[allow(clippy::too_many_arguments)]
+        fn prefill_attention_f16io(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            q: &CudaView<'_, f16>,
+            key_cache: &CudaSlice<f16>,
+            value_cache: &CudaSlice<f16>,
+            block_tables: &CudaView<'_, i32>,
+            context_lens: &CudaView<'_, i32>,
+            seq_start_pos: &CudaView<'_, i32>,
+            num_tokens: usize,
+            num_seqs: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+            max_context_len: u32,
+            block_size: usize,
+        ) -> Result<CudaSlice<f16>> {
+            let kernel = loader.get_func("flash_attention_3_prefill", "flash_attention_3_prefill_f16io_kernel")
+                .map_err(|e| LLMError::GpuError(format!("load prefill f16io kernel: {e}")))?;
+
+            let out_len = num_tokens * num_heads * head_dim;
+            let mut output = unsafe { stream.alloc::<f16>(out_len) }
+                .map_err(|e| LLMError::GpuError(format!("prefill_attn_f16io alloc: {e}")))?;
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            const FA3_BC: usize = 64;
+            const FA3_THREADS: u32 = 256;
+            let smem = (FA3_BC * head_dim + FA3_BC + 8) * std::mem::size_of::<f32>();
+            let shared_mem_bytes = smem as u32;
+
+            if num_seqs == 0 {
+                return Err(LLMError::GpuError("prefill_attention_f16io: num_seqs == 0".into()));
+            }
+
+            let cfg = LaunchConfig {
+                grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                block_dim: (FA3_THREADS, 1, 1),
+                shared_mem_bytes,
+            };
+
+            let max_blocks_per_seq = (DeviceSlice::len(block_tables) / num_seqs) as i32;
+
+            if shared_mem_bytes > 49152 {
+                kernel.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                ).map_err(|e| LLMError::GpuError(format!("prefill FA3 f16io set max shared mem: {e}")))?;
+            }
+
+            unsafe {
+                stream.launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(q)
+                    .arg(key_cache).arg(value_cache)
+                    .arg(block_tables).arg(context_lens)
+                    .arg(seq_start_pos)
+                    .arg(&scale)
+                    .arg(&(num_heads as i32))
+                    .arg(&(num_kv_heads as i32))
+                    .arg(&(head_dim as i32))
+                    .arg(&(block_size as i32))
+                    .arg(&(max_context_len as i32))
+                    .arg(&max_blocks_per_seq)
+                    .arg(&(num_tokens as i32))
+                    .arg(&1i32) // causal
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("prefill FA3 f16io launch: {e}")))?;
             }
 
             Ok(output)

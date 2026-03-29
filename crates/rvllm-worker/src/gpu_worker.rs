@@ -607,8 +607,127 @@ impl GpuWorker {
                 "GPU model runner initialized with {} GPU blocks (block_size={})",
                 num_gpu_blocks, block_size
             );
+
+            // Pre-capture CUDA graphs for common decode batch sizes to avoid
+            // mid-generation capture stalls.
+            if let Err(e) = self.precapture_decode_graphs() {
+                warn!("pre-capture failed: {e} -- graphs will be captured lazily");
+            }
         }
 
+        Ok(())
+    }
+
+    /// Pre-capture CUDA graphs for common decode batch sizes at startup.
+    /// Eliminates mid-generation graph capture stalls by populating the graph
+    /// pool with pre-built graphs for standard bucket sizes.
+    #[cfg(feature = "cuda")]
+    fn precapture_decode_graphs(&mut self) -> Result<()> {
+        use rvllm_model_runner::bridge::AttentionMetadata;
+
+        const BUCKET_SIZES: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256];
+        // Max batch size matches the GraphRunnerConfig created in new() (256).
+        let max_batch = 256usize;
+
+        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+            LLMError::GpuError("GPU model runner not initialized for precapture".into())
+        })?;
+
+        if !self.graph_runner.is_enabled() {
+            info!("graph capture disabled, skipping pre-capture");
+            return Ok(());
+        }
+
+        let cuda_stream = runner.cuda_stream().clone();
+        let t0 = std::time::Instant::now();
+        let mut captured = 0usize;
+        let mut skipped = 0usize;
+
+        for &n in BUCKET_SIZES {
+            if n > max_batch {
+                break;
+            }
+
+            // Skip if already captured (shouldn't happen at init, but be safe)
+            if self.graph_runner.has_graph_for_exact(n) {
+                continue;
+            }
+
+            let token_ids = vec![0u32; n];
+            let positions = vec![0u32; n];
+            let attn_meta = AttentionMetadata {
+                context_lens: vec![1; n],
+                block_tables: vec![vec![0u32]; n],
+                slot_mapping: vec![0; n],
+                query_lens: vec![1; n],
+                max_context_len: 1,
+            };
+
+            // Warmup forward (outside capture)
+            if let Err(e) = runner.upload_metadata(&token_ids, &positions, &attn_meta) {
+                warn!(n, "precapture upload failed: {e}");
+                skipped += 1;
+                continue;
+            }
+            if let Err(e) = runner.forward_gpu_only(n, n, 1, false) {
+                warn!(n, "precapture warmup forward failed: {e}");
+                skipped += 1;
+                continue;
+            }
+
+            // Sync before capture
+            if let Err(e) = cuda_stream.synchronize() {
+                warn!(n, "precapture sync failed: {e}");
+                skipped += 1;
+                continue;
+            }
+
+            // Re-upload for capture
+            if let Err(e) = runner.upload_metadata(&token_ids, &positions, &attn_meta) {
+                warn!(n, "precapture re-upload failed: {e}");
+                skipped += 1;
+                continue;
+            }
+
+            // Begin capture
+            if let Err(e) = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream) {
+                warn!(n, "precapture begin_capture failed: {e}");
+                self.graph_runner.mark_captured(n);
+                skipped += 1;
+                continue;
+            }
+
+            // Forward inside capture
+            match runner.forward_gpu_only(n, n, 1, false) {
+                Ok(()) => {
+                    match self.graph_runner.pool_mut().end_capture_on(&cuda_stream, n) {
+                        Ok(graph) => {
+                            self.graph_runner.pool_mut().insert(graph);
+                            self.graph_runner.mark_captured(n);
+                            captured += 1;
+                        }
+                        Err(e) => {
+                            warn!(n, "precapture end_capture failed: {e}");
+                            self.graph_runner.mark_captured(n);
+                            skipped += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(n, "precapture forward failed: {e}");
+                    let _ = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, n);
+                    self.graph_runner.mark_captured(n);
+                    skipped += 1;
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        info!(
+            captured, skipped,
+            elapsed_ms = elapsed.as_millis(),
+            "CUDA graph pre-capture complete"
+        );
         Ok(())
     }
 
