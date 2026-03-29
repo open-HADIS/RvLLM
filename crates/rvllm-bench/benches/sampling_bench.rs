@@ -46,7 +46,8 @@ fn apply_top_k(logits: &mut [f32], k: usize) {
         return;
     }
     let mut vals: Vec<f32> = logits.to_vec();
-    vals.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    // Use partial sort (O(n)) instead of full sort (O(n log n)) -- matches numpy argpartition
+    vals.select_nth_unstable_by(k - 1, |a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let threshold = vals[k - 1];
     for l in logits.iter_mut() {
         if *l < threshold {

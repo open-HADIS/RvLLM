@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Equivalent Python/numpy/torch benchmarks for comparison with Rust rvllm."""
 
+import os
 import time
 import numpy as np
 import json
@@ -58,9 +59,9 @@ def apply_top_p(logits, p):
     cumsum = np.cumsum(probs[sorted_idx])
     cutoff = np.searchsorted(cumsum, p) + 1
     keep = sorted_idx[:cutoff]
-    logits = np.full_like(logits, float('-inf'))
-    logits[keep] = probs[keep]
-    return logits
+    out = np.full_like(logits, float('-inf'))
+    out[keep] = logits[keep]  # keep original logit values, not probabilities
+    return out
 
 def apply_min_p(logits, min_p):
     probs = softmax(logits)
@@ -369,7 +370,7 @@ def main():
         print(f"  {r['name']:55s}  median: {format_time(r['median_ns']):>12s}  mean: {format_time(r['mean_ns']):>12s}")
 
     # Save JSON
-    out_path = "/Users/andy/hermes-lite/vllm-rs/benches/python_results.json"
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "python_results.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")
