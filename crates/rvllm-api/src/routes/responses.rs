@@ -139,6 +139,7 @@ pub async fn create_response(
 
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let response_text = req.normalize_text_config()?;
+    let response_reasoning = req.normalize_reasoning_config()?;
     let sampling_params = req.to_sampling_params();
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
@@ -164,6 +165,7 @@ pub async fn create_response(
             req.temperature,
             req.top_p,
             req.metadata.clone(),
+            response_reasoning.clone(),
             req.parallel_tool_calls,
             response_text.clone(),
             tool_choice.clone(),
@@ -192,6 +194,7 @@ pub async fn create_response(
         let input_items_clone = input_items.clone();
         let conversation_items_clone = conversation_items.clone();
         let function_tools_clone = function_tools.clone();
+        let response_reasoning_clone = response_reasoning.clone();
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
 
@@ -210,6 +213,7 @@ pub async fn create_response(
                     &req_clone,
                     &output,
                     &function_tools_clone,
+                    response_reasoning_clone.clone(),
                     tool_choice_clone.clone(),
                     response_tools_clone.clone(),
                 )
@@ -270,6 +274,7 @@ pub async fn create_response(
         let response_store = state.response_store.clone();
         let response_id_clone = response_id.clone();
         let response_text_clone = response_text.clone();
+        let response_reasoning_clone = response_reasoning.clone();
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
 
@@ -293,6 +298,7 @@ pub async fn create_response(
                 req_clone.temperature,
                 req_clone.top_p,
                 req_clone.metadata.clone(),
+                response_reasoning_clone.clone(),
                 req_clone.parallel_tool_calls,
                 response_text_clone.clone(),
                 tool_choice_clone.clone(),
@@ -416,6 +422,7 @@ pub async fn create_response(
                                 req_clone.temperature,
                                 req_clone.top_p,
                                 req_clone.metadata.clone(),
+                                response_reasoning_clone.clone(),
                                 req_clone.parallel_tool_calls,
                                 response_text_clone.clone(),
                                 tool_choice_clone,
@@ -442,6 +449,7 @@ pub async fn create_response(
                 req_clone.metadata.clone(),
                 output_items.clone(),
                 ResponseUsage::from_request_output(&output),
+                response_reasoning_clone,
                 req_clone.parallel_tool_calls,
                 response_text_clone,
                 req_clone.effective_tool_choice(),
@@ -545,6 +553,7 @@ pub async fn create_response(
             &req,
             &output,
             &function_tools,
+            response_reasoning,
             tool_choice,
             response_tools,
         )?;
@@ -600,6 +609,7 @@ async fn stream_tool_response(
     let model = state.model_name.clone();
     let response_store = state.response_store.clone();
     let response_text = req.normalize_text_config().ok();
+    let response_reasoning = req.normalize_reasoning_config().ok();
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
 
@@ -622,6 +632,7 @@ async fn stream_tool_response(
             req.temperature,
             req.top_p,
             req.metadata.clone(),
+            response_reasoning.clone().unwrap_or_default(),
             req.parallel_tool_calls,
             response_text.clone().unwrap_or_default(),
             tool_choice.clone(),
@@ -657,6 +668,7 @@ async fn stream_tool_response(
                         req.temperature,
                         req.top_p,
                         req.metadata.clone(),
+                        response_reasoning.clone().unwrap_or_default(),
                         req.parallel_tool_calls,
                         response_text.clone().unwrap_or_default(),
                         tool_choice.clone(),
@@ -1055,6 +1067,7 @@ async fn stream_tool_response(
             req.metadata.clone(),
             output_items.clone(),
             ResponseUsage::from_request_output(&output),
+            response_reasoning.unwrap_or_default(),
             req.parallel_tool_calls,
             response_text.unwrap_or_default(),
             tool_choice,
@@ -1137,6 +1150,7 @@ fn response_from_output(
     req: &CreateResponseRequest,
     output: &rvllm_core::prelude::RequestOutput,
     function_tools: &[crate::types::responses::ResponseFunctionTool],
+    reasoning: crate::types::responses::ResponseReasoningSummary,
     tool_choice: ResponseToolChoice,
     response_tools: Vec<serde_json::Value>,
 ) -> Result<ResponseObject, ApiError> {
@@ -1163,6 +1177,7 @@ fn response_from_output(
         req.metadata.clone(),
         output_items,
         ResponseUsage::from_request_output(output),
+        reasoning,
         req.parallel_tool_calls,
         req.normalize_text_config()?,
         tool_choice,
@@ -1668,6 +1683,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_response_route_echoes_reasoning_effort() {
+        let (server, _) = make_server(vec![vec![request_output("done", true)]]);
+
+        let response = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Think a bit",
+                "reasoning": {
+                    "effort": "low"
+                }
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let body = response.json::<serde_json::Value>();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[tokio::test]
     async fn background_response_returns_in_progress_then_completes() {
         let (server, _) = make_server(vec![vec![request_output("done", true)]]);
 
@@ -1699,8 +1735,32 @@ mod tests {
         }
 
         let retrieved = retrieved.expect("background response did not complete in time");
+        assert_eq!(retrieved["reasoning"]["effort"], serde_json::Value::Null);
         assert_eq!(retrieved["output"][0]["type"], "message");
         assert_eq!(retrieved["output"][0]["content"][0]["text"], "done");
+    }
+
+    #[tokio::test]
+    async fn background_response_preserves_reasoning_effort() {
+        let (server, _) = make_server(vec![vec![request_output("done", true)]]);
+
+        let created = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Hello",
+                "store": true,
+                "background": true,
+                "reasoning": {
+                    "effort": "medium"
+                }
+            }))
+            .await;
+
+        created.assert_status_ok();
+        let created = created.json::<serde_json::Value>();
+        assert_eq!(created["status"], "in_progress");
+        assert_eq!(created["reasoning"]["effort"], "medium");
     }
 
     #[tokio::test]

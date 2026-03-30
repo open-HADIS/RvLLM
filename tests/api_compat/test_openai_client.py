@@ -280,6 +280,20 @@ class TestResponses:
         data = r.json()
         assert data["text"]["format"]["type"] == "json_object"
 
+    def test_response_reasoning_effort(self):
+        """Responses accept reasoning.effort and echo it in the response"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Think briefly",
+            "reasoning": {
+                "effort": "low",
+            },
+            "max_output_tokens": 8,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["reasoning"]["effort"] == "low"
+
     def test_response_rejects_built_in_tools(self):
         """Built-in Responses tools are still rejected explicitly"""
         r = requests.post(f"{BASE_URL}/v1/responses", json={

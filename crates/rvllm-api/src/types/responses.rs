@@ -508,6 +508,7 @@ impl ResponseObject {
         temperature: f32,
         top_p: f32,
         metadata: BTreeMap<String, String>,
+        reasoning: ResponseReasoningSummary,
         parallel_tool_calls: bool,
         text: ResponseTextConfig,
         tool_choice: ResponseToolChoice,
@@ -527,7 +528,7 @@ impl ResponseObject {
             output: Vec::new(),
             parallel_tool_calls,
             previous_response_id,
-            reasoning: ResponseReasoningSummary::default(),
+            reasoning,
             store,
             temperature,
             text,
@@ -553,6 +554,7 @@ impl ResponseObject {
         metadata: BTreeMap<String, String>,
         output: Vec<ResponseOutputItem>,
         usage: ResponseUsage,
+        reasoning: ResponseReasoningSummary,
         parallel_tool_calls: bool,
         text: ResponseTextConfig,
         tool_choice: ResponseToolChoice,
@@ -572,7 +574,7 @@ impl ResponseObject {
             output,
             parallel_tool_calls,
             previous_response_id,
-            reasoning: ResponseReasoningSummary::default(),
+            reasoning,
             store,
             temperature,
             text,
@@ -633,11 +635,7 @@ impl CreateResponseRequest {
             }
         }
         let _ = self.normalize_text_config()?;
-        if self.reasoning.is_some() {
-            return Err(ApiError::InvalidRequest(
-                "reasoning configuration is not supported on /v1/responses yet".into(),
-            ));
-        }
+        let _ = self.normalize_reasoning_config()?;
         if self.conversation.is_some() {
             return Err(ApiError::InvalidRequest(
                 "conversation state objects are not supported on /v1/responses yet".into(),
@@ -796,6 +794,52 @@ impl CreateResponseRequest {
                 other
             ))),
         }
+    }
+
+    pub fn normalize_reasoning_config(&self) -> Result<ResponseReasoningSummary, ApiError> {
+        let Some(reasoning) = &self.reasoning else {
+            return Ok(ResponseReasoningSummary::default());
+        };
+        let Some(map) = reasoning.as_object() else {
+            return Err(ApiError::InvalidRequest(
+                "responses reasoning must be an object".into(),
+            ));
+        };
+
+        let mut normalized = ResponseReasoningSummary::default();
+        for (key, value) in map {
+            match key.as_str() {
+                "effort" => {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let effort = value.as_str().ok_or_else(|| {
+                        ApiError::InvalidRequest(
+                            "responses reasoning.effort must be a string".into(),
+                        )
+                    })?;
+                    match effort {
+                        "minimal" | "low" | "medium" | "high" => {
+                            normalized.effort = Some(effort.to_string());
+                        }
+                        other => {
+                            return Err(ApiError::InvalidRequest(format!(
+                                "responses reasoning.effort '{}' is not supported yet",
+                                other
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "responses reasoning.{} is not supported yet",
+                        other
+                    )));
+                }
+            }
+        }
+
+        Ok(normalized)
     }
 
     pub fn normalize_input_items(&self) -> Result<Vec<ResponseInputItem>, ApiError> {
@@ -1317,6 +1361,103 @@ mod tests {
             truncation: None,
         };
         assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn request_accepts_reasoning_effort() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: Some(serde_json::json!({
+                "effort": "medium"
+            })),
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        assert_eq!(
+            req.normalize_reasoning_config().unwrap(),
+            ResponseReasoningSummary {
+                effort: Some("medium".into()),
+                summary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn request_rejects_unsupported_reasoning_field() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: Some(serde_json::json!({
+                "summary": "auto"
+            })),
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("responses reasoning.summary is not supported yet"));
+    }
+
+    #[test]
+    fn request_rejects_unknown_reasoning_effort() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: Some(serde_json::json!({
+                "effort": "max"
+            })),
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("responses reasoning.effort 'max' is not supported yet"));
     }
 
     #[test]
