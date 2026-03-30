@@ -656,8 +656,14 @@ mod cuda_impl {
             // Extract raw device pointers. DevicePtr::device_ptr works for all
             // (read-only trait, kernel handles mutability). All on same stream so
             // ordering is implicit.
-            let (mlp_out_ptr, _g0) = DevicePtr::device_ptr(&mlp_out, &self.stream);
-            let (res_out_ptr, _g1) = DevicePtr::device_ptr(&residual_out, &self.stream);
+            let mlp_out_ptr = {
+                let (p, _g) = DevicePtr::device_ptr(&mlp_out, &self.stream);
+                p
+            };
+            let res_out_ptr = {
+                let (p, _g) = DevicePtr::device_ptr(&residual_out, &self.stream);
+                p
+            };
             let (prev_res_ptr, _g2) = DevicePtr::device_ptr(prev_residual, &self.stream);
 
             // prev_mlp: NULL (0u64) for layer 0
@@ -1606,7 +1612,7 @@ mod cuda_impl {
                 fused_gate_up: self.fused_gate_up_weights.get(i),
                 qkv_bias: self.fused_qkv_bias.get(i).and_then(|o| o.as_ref()),
                 fused_qkv_fp8: self.fp8_fused_qkv.get(i),
-                fused_qkv_scale: self.fp8_fused_qkv_scale.get(i),
+                fused_qkv_fp8_scale: self.fp8_fused_qkv_scale.get(i),
                 o_proj_fp8: self.fp8_o_proj.get(i),
                 o_proj_scale: self.fp8_o_proj_scale.get(i),
                 fused_gate_up_fp8: self.fp8_fused_gate_up.get(i),
