@@ -753,33 +753,68 @@ mod inner {
                     hidden_f16
                 };
 
-                // 2. QKV GEMM into scratch
-                if let Some(fused_qkv) = weights.fused_qkv {
-                    Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_qkv,
-                        num_tokens, qkv_dim, hidden, &self.loader,
-                        weights.fused_qkv_fp8, s.qkv)?;
-                } else {
-                    let q_end_t = num_tokens * q_dim;
-                    let k_end_t = q_end_t + num_tokens * kv_dim;
-                    { let mut d = s.qkv.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
-                    { let mut d = s.qkv.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                    { let mut d = s.qkv.slice_mut(k_end_t..k_end_t + num_tokens * kv_dim); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                }
-
-                // 3. QKV bias
-                if let Some(bias) = weights.qkv_bias {
-                    if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
-                        let total = (num_tokens * qkv_dim) as u32;
+                // 2-3. QKV GEMM + bias: try CUTLASS fused kernel first
+                if let (Some(fused_qkv), Some(bias)) = (weights.fused_qkv, weights.qkv_bias) {
+                    if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_qkv_bias", "cutlass_qkv_bias_gemm") {
+                        // CUTLASS: fused QKV GEMM + bias add in one kernel (D = A*B + bias)
+                        let m = num_tokens as i32;
+                        let n = qkv_dim as i32;
+                        let k = hidden as i32;
                         let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
                         unsafe {
-                            self.stream.launch_builder(bk)
-                                .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
-                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
+                            self.stream.launch_builder(cutlass_fn)
+                                .arg(&mut qkv_view).arg(&*s.normed).arg(fused_qkv).arg(bias)
+                                .arg(&m).arg(&n).arg(&k)
+                                .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("cutlass qkv+bias: {e}")))?;
                         }
                     } else {
-                        let mut v = s.qkv.slice_mut(..q_end);
-                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
+                        // Fallback: cuBLAS GEMM + separate bias
+                        Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_qkv,
+                            num_tokens, qkv_dim, hidden, &self.loader,
+                            weights.fused_qkv_fp8, s.qkv)?;
+                        if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
+                            let total = (num_tokens * qkv_dim) as u32;
+                            let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
+                            unsafe {
+                                self.stream.launch_builder(bk)
+                                    .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                    .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
+                            }
+                        } else {
+                            let mut v = s.qkv.slice_mut(..q_end);
+                            Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
+                        }
+                    }
+                } else {
+                    // No fused QKV or no bias -- original path
+                    if let Some(fused_qkv) = weights.fused_qkv {
+                        Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_qkv,
+                            num_tokens, qkv_dim, hidden, &self.loader,
+                            weights.fused_qkv_fp8, s.qkv)?;
+                    } else {
+                        let q_end_t = num_tokens * q_dim;
+                        let k_end_t = q_end_t + num_tokens * kv_dim;
+                        { let mut d = s.qkv.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
+                        { let mut d = s.qkv.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                        { let mut d = s.qkv.slice_mut(k_end_t..k_end_t + num_tokens * kv_dim); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                    }
+                    // Bias (no CUTLASS available for separate bias case)
+                    if let Some(bias) = weights.qkv_bias {
+                        if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
+                            let total = (num_tokens * qkv_dim) as u32;
+                            let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
+                            unsafe {
+                                self.stream.launch_builder(bk)
+                                    .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                    .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
+                            }
+                        } else {
+                            let mut v = s.qkv.slice_mut(..q_end);
+                            Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
+                        }
                     }
                 }
 
@@ -824,20 +859,53 @@ mod inner {
 
                 if dbg { dbg_dump("attn_out", &attn_out, &self.stream); }
 
-                // 7. O projection into scratch
-                Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &attn_out, weights.o_proj,
-                    num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, s.o_proj)?;
-
-                // 8. Post-attention norm into scratch
-                Self::fused_residual_rmsnorm_f16_into(
-                    &self.stream, &self.loader, residual_ref, &*s.o_proj, post_norm_w,
-                    cfg.rms_norm_eps, num_tokens, hidden, s.normed, s.residual)?;
+                // 7-8. O projection + residual add: try CUTLASS fused kernel first
+                if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_oproj_residual", "cutlass_oproj_residual_gemm") {
+                    // CUTLASS: O-proj GEMM with residual add epilogue (D = A*B + residual)
+                    let m = num_tokens as i32;
+                    let n = hidden as i32;
+                    let k = q_dim as i32;
+                    unsafe {
+                        self.stream.launch_builder(cutlass_fn)
+                            .arg(&mut *s.o_proj).arg(&attn_out).arg(weights.o_proj).arg(residual_ref)
+                            .arg(&m).arg(&n).arg(&k)
+                            .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("cutlass oproj+residual: {e}")))?;
+                    }
+                    // o_proj now contains GEMM + residual; copy to residual scratch, then RMSNorm
+                    self.stream.memcpy_dtod(&s.o_proj.slice(..num_tokens * hidden), &mut s.residual.slice_mut(..num_tokens * hidden))
+                        .map_err(|e| LLMError::GpuError(format!("oproj residual copy: {e}")))?;
+                    Self::rms_norm_f16_into(&self.stream, &self.loader, &*s.residual, post_norm_w,
+                        cfg.rms_norm_eps, num_tokens, hidden, s.normed)?;
+                } else {
+                    // Fallback: cuBLAS O-proj + fused_residual_rmsnorm
+                    Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &attn_out, weights.o_proj,
+                        num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, s.o_proj)?;
+                    Self::fused_residual_rmsnorm_f16_into(
+                        &self.stream, &self.loader, residual_ref, &*s.o_proj, post_norm_w,
+                        cfg.rms_norm_eps, num_tokens, hidden, s.normed, s.residual)?;
+                }
 
                 // 9. Gate+up GEMM into scratch, then silu_mul into scratch
                 if let Some(fused_gate_up) = weights.fused_gate_up {
                     let gate_up_dim = intermediate * 2;
-                    Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_gate_up,
-                        num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, s.gate_up)?;
+                    if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_gateup_silu", "cutlass_gateup_gemm") {
+                        // CUTLASS: better tiling for gate+up GEMM
+                        let m = num_tokens as i32;
+                        let n = gate_up_dim as i32;
+                        let k = hidden as i32;
+                        unsafe {
+                            self.stream.launch_builder(cutlass_fn)
+                                .arg(&mut *s.gate_up).arg(&*s.normed).arg(fused_gate_up)
+                                .arg(&m).arg(&n).arg(&k)
+                                .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("cutlass gateup: {e}")))?;
+                        }
+                    } else {
+                        // Fallback: cuBLAS
+                        Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_gate_up,
+                            num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, s.gate_up)?;
+                    }
                     if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
                         let n_elems = num_tokens * intermediate;
                         let total = n_elems as u32;
@@ -899,9 +967,46 @@ mod inner {
             };
             let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
 
-            // 2. QKV
-            let mut qkv = {
-                if let Some(fused_qkv) = weights.fused_qkv {
+            // 2-3. QKV + bias: try CUTLASS fused kernel first
+            let mut qkv = if let (Some(fused_qkv), Some(bias)) = (weights.fused_qkv, weights.qkv_bias) {
+                if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_qkv_bias", "cutlass_qkv_bias_gemm") {
+                    // CUTLASS: fused QKV GEMM + bias add (D = A*B + bias)
+                    let m = num_tokens as i32;
+                    let n = qkv_dim as i32;
+                    let k = hidden as i32;
+                    let mut qkv_out = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("cutlass qkv alloc: {e}")))?;
+                    unsafe {
+                        self.stream.launch_builder(cutlass_fn)
+                            .arg(&mut qkv_out).arg(&normed).arg(fused_qkv).arg(bias)
+                            .arg(&m).arg(&n).arg(&k)
+                            .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("cutlass qkv+bias: {e}")))?;
+                    }
+                    qkv_out
+                } else {
+                    // Fallback: cuBLAS + separate bias
+                    let mut q = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed, fused_qkv,
+                        num_tokens, qkv_dim, hidden, &self.loader,
+                        weights.fused_qkv_fp8, None)?;
+                    if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
+                        let total = (num_tokens * qkv_dim) as u32;
+                        let mut qkv_view = q.slice_mut(..num_tokens * qkv_dim);
+                        unsafe {
+                            self.stream.launch_builder(bk)
+                                .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
+                        }
+                    } else {
+                        let mut v = q.slice_mut(..q_end);
+                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
+                    }
+                    q
+                }
+            } else {
+                // No fused QKV+bias -- original paths
+                let mut qkv_buf = if let Some(fused_qkv) = weights.fused_qkv {
                     Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed, fused_qkv,
                         num_tokens, qkv_dim, hidden, &self.loader,
                         weights.fused_qkv_fp8, None)?
@@ -914,25 +1019,24 @@ mod inner {
                     { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
                     { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
                     qkv_buf
-                }
-            };
-
-            // 3. QKV bias
-            if let Some(bias) = weights.qkv_bias {
-                if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
-                    let total = (num_tokens * qkv_dim) as u32;
-                    let mut qkv_view = qkv.slice_mut(..num_tokens * qkv_dim);
-                    unsafe {
-                        self.stream.launch_builder(bk)
-                            .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
-                            .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
+                };
+                if let Some(bias) = weights.qkv_bias {
+                    if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
+                        let total = (num_tokens * qkv_dim) as u32;
+                        let mut qkv_view = qkv_buf.slice_mut(..num_tokens * qkv_dim);
+                        unsafe {
+                            self.stream.launch_builder(bk)
+                                .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
+                        }
+                    } else {
+                        let mut v = qkv_buf.slice_mut(..q_end);
+                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
                     }
-                } else {
-                    let mut v = qkv.slice_mut(..q_end);
-                    Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
                 }
-            }
+                qkv_buf
+            };
 
             // 4. RoPE
             {
@@ -975,18 +1079,56 @@ mod inner {
 
             if dbg { dbg_dump("attn_out", &attn_out, &self.stream); }
 
-            // 7. O projection
-            let attn_proj = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &attn_out, weights.o_proj,
-                num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, None)?;
-
-            // 8-10. Post-attention MLP
-            let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
-                &self.stream, &self.loader, residual_ref, &attn_proj, post_norm_w,
-                cfg.rms_norm_eps, num_tokens, hidden)?;
+            // 7-8. O projection + residual: try CUTLASS fused kernel first
+            let (normed2, residual) = if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_oproj_residual", "cutlass_oproj_residual_gemm") {
+                // CUTLASS: O-proj GEMM with residual add epilogue (D = A*B + residual)
+                let m = num_tokens as i32;
+                let n = hidden as i32;
+                let k = q_dim as i32;
+                let mut oproj_out = unsafe { self.stream.alloc::<f16>(num_tokens * hidden) }
+                    .map_err(|e| LLMError::GpuError(format!("cutlass oproj alloc: {e}")))?;
+                unsafe {
+                    self.stream.launch_builder(cutlass_fn)
+                        .arg(&mut oproj_out).arg(&attn_out).arg(weights.o_proj).arg(residual_ref)
+                        .arg(&m).arg(&n).arg(&k)
+                        .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+                        .map_err(|e| LLMError::GpuError(format!("cutlass oproj+residual: {e}")))?;
+                }
+                // oproj_out = GEMM + residual; just RMSNorm (no separate add)
+                let normed2 = Self::rms_norm_f16(&self.stream, &self.loader, &oproj_out, post_norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden)?;
+                (normed2, oproj_out)
+            } else {
+                // Fallback: cuBLAS O-proj + fused_residual_rmsnorm
+                let attn_proj = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &attn_out, weights.o_proj,
+                    num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, None)?;
+                let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
+                    &self.stream, &self.loader, residual_ref, &attn_proj, post_norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden)?;
+                (normed2, residual)
+            };
             let fused_act = if let Some(fused_gate_up) = weights.fused_gate_up {
                 let gate_up_dim = intermediate * 2;
-                let gu_interleaved = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
-                    num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?;
+                let gu_interleaved = if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_gateup_silu", "cutlass_gateup_gemm") {
+                    // CUTLASS: better tiling for gate+up GEMM
+                    let m = num_tokens as i32;
+                    let n = gate_up_dim as i32;
+                    let k = hidden as i32;
+                    let mut gu_out = unsafe { self.stream.alloc::<f16>(num_tokens * gate_up_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("cutlass gateup alloc: {e}")))?;
+                    unsafe {
+                        self.stream.launch_builder(cutlass_fn)
+                            .arg(&mut gu_out).arg(&normed2).arg(fused_gate_up)
+                            .arg(&m).arg(&n).arg(&k)
+                            .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("cutlass gateup: {e}")))?;
+                    }
+                    gu_out
+                } else {
+                    // Fallback: cuBLAS
+                    Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
+                        num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?
+                };
                 if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
                     let n_elems = num_tokens * intermediate;
                     let mut fused_out = unsafe { self.stream.alloc::<f16>(n_elems) }

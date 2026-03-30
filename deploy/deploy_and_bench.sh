@@ -15,6 +15,7 @@
 #   --skip-compile      skip kernel PTX compilation
 #   --bench-only        skip coherence tests (implies nothing about build)
 #   --output-len <N>    tokens per benchmark request (default: 32)
+#   --with-cutlass [dir] compile CUTLASS kernels (default dir: /root/cutlass)
 #
 # Environment:
 #   RVLLM_PTX_DIR   override PTX directory (default: kernels/<arch>)
@@ -32,6 +33,8 @@ SKIP_BUILD=0
 SKIP_COMPILE=0
 BENCH_ONLY=0
 OUTPUT_LEN=32
+WITH_CUTLASS=0
+CUTLASS_DIR="/root/cutlass"
 PORT="${PORT:-8000}"
 BASE_URL="http://localhost:${PORT}"
 
@@ -44,6 +47,13 @@ while [[ $# -gt 0 ]]; do
         --skip-compile) SKIP_COMPILE=1; shift ;;
         --bench-only)  BENCH_ONLY=1; shift ;;
         --output-len)  OUTPUT_LEN="$2"; shift 2 ;;
+        --with-cutlass)
+            WITH_CUTLASS=1
+            # Optional: next arg is cutlass dir if it doesn't start with --
+            if [[ $# -ge 2 && ! "$2" == --* ]]; then
+                CUTLASS_DIR="$2"; shift
+            fi
+            shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -170,6 +180,26 @@ if [[ "$SKIP_COMPILE" -eq 0 ]]; then
 else
     step "Step 1: Skipping kernel compilation (--skip-compile)"
     export RVLLM_PTX_DIR="${RVLLM_PTX_DIR:-$REPO_DIR/kernels/$ARCH}"
+    echo ""
+fi
+
+# ============================================================
+# Step 1b: Compile CUTLASS kernels (optional)
+# ============================================================
+if [[ "$WITH_CUTLASS" -eq 1 ]]; then
+    step "Step 1b: Compile CUTLASS kernels (${ARCH})"
+
+    if [ ! -d "$CUTLASS_DIR/include/cutlass" ]; then
+        echo "CUTLASS not found at $CUTLASS_DIR, cloning..."
+        git clone --depth 1 https://github.com/NVIDIA/cutlass "$CUTLASS_DIR"
+    fi
+
+    CUTLASS_BUILD="$REPO_DIR/kernels/build_cutlass.sh"
+    if [[ -x "$CUTLASS_BUILD" ]] || [[ -f "$CUTLASS_BUILD" ]]; then
+        bash "$CUTLASS_BUILD" "$ARCH" "$CUTLASS_DIR"
+    else
+        warn "build_cutlass.sh not found at $CUTLASS_BUILD"
+    fi
     echo ""
 fi
 
