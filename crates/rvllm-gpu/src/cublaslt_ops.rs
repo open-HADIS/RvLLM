@@ -22,12 +22,38 @@ pub const CUBLASLT_M_THRESHOLD: usize = 32;
 /// 4 MiB workspace for split-K heuristics in cublasLt.
 const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 
+/// Cached FP8 matmul plan (descriptors + algo) for a specific (M, N, K) shape.
+struct Fp8Plan {
+    desc: lt_sys::cublasLtMatmulDesc_t,
+    layout_a: lt_sys::cublasLtMatrixLayout_t,
+    layout_b: lt_sys::cublasLtMatrixLayout_t,
+    layout_c: lt_sys::cublasLtMatrixLayout_t,
+    algo: lt_sys::cublasLtMatmulAlgo_t,
+}
+
+// cublasLt handles are thread-safe (used on a single GPU stream)
+unsafe impl Send for Fp8Plan {}
+unsafe impl Sync for Fp8Plan {}
+
+impl Drop for Fp8Plan {
+    fn drop(&mut self) {
+        unsafe {
+            lt_sys::cublasLtMatrixLayoutDestroy(self.layout_a);
+            lt_sys::cublasLtMatrixLayoutDestroy(self.layout_b);
+            lt_sys::cublasLtMatrixLayoutDestroy(self.layout_c);
+            lt_sys::cublasLtMatmulDescDestroy(self.desc);
+        }
+    }
+}
+
 /// Wrapper around cudarc's `CudaBlasLT` with workspace for heuristic algo selection.
 pub struct CublasLtOps {
     handle: CudaBlasLT,
     stream: Arc<CudaStream>,
     /// Persistent workspace for cublasLtMatmul (split-K, etc).
     workspace: CudaSlice<u8>,
+    /// Cached FP8 plans keyed by (m, n, k).
+    fp8_cache: std::collections::HashMap<(usize, usize, usize), Fp8Plan>,
 }
 
 impl CublasLtOps {
@@ -36,7 +62,7 @@ impl CublasLtOps {
             .map_err(|e| LLMError::GpuError(format!("CudaBlasLT init failed: {e}")))?;
         let workspace = unsafe { stream.alloc::<u8>(FP8_WORKSPACE_SIZE) }
             .map_err(|e| LLMError::GpuError(format!("cublasLt workspace alloc: {e}")))?;
-        Ok(Self { handle, stream, workspace })
+        Ok(Self { handle, stream, workspace, fp8_cache: std::collections::HashMap::new() })
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -174,83 +200,80 @@ impl CublasLtOps {
         Ok(())
     }
 
-    /// FP8 E4M3 GEMM via raw device pointers.
+    /// FP8 E4M3 GEMM via raw device pointers with cached plan.
     /// C_f16[m,n] = A_fp8[m,k] @ B_fp8[n,k]^T
-    /// All pointers are raw u64 device addresses to avoid borrow issues.
+    /// First call for a given (m,n,k) creates descriptors + selects algo.
+    /// Subsequent calls reuse the cached plan (just the matmul dispatch).
     pub fn fp8_gemm_a_bt_raw(
-        &self,
+        &mut self,
         m: usize,
         n: usize,
         k: usize,
-        input_fp8_ptr: u64,   // [m, k] FP8
-        weight_fp8_ptr: u64,  // [n, k] FP8
-        output_f16_ptr: u64,  // [m, n] FP16
+        input_fp8_ptr: u64,
+        weight_fp8_ptr: u64,
+        output_f16_ptr: u64,
     ) -> Result<()> {
         use std::ffi::c_void;
 
+        let key = (m, n, k);
+        if !self.fp8_cache.contains_key(&key) {
+            unsafe {
+                let handle = self.handle.handle();
+                let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
+                let s = lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
+                if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    return Err(LLMError::GpuError(format!("fp8 desc create: {s:?}")));
+                }
+                let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
+                let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
+                lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &trans_a as *const _ as *const c_void, std::mem::size_of_val(&trans_a));
+                lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &trans_b as *const _ as *const c_void, std::mem::size_of_val(&trans_b));
+
+                let mut layout_a: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                let mut layout_b: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                let mut layout_c: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                lt_sys::cublasLtMatrixLayoutCreate(&mut layout_a, lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
+                lt_sys::cublasLtMatrixLayoutCreate(&mut layout_b, lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, k as u64, m as u64, k as i64);
+                lt_sys::cublasLtMatrixLayoutCreate(&mut layout_c, lt_sys::cudaDataType_t::CUDA_R_16F, n as u64, m as u64, n as i64);
+
+                let mut pref: lt_sys::cublasLtMatmulPreference_t = std::ptr::null_mut();
+                lt_sys::cublasLtMatmulPreferenceCreate(&mut pref);
+                let ws_size: usize = FP8_WORKSPACE_SIZE;
+                lt_sys::cublasLtMatmulPreferenceSetAttribute(pref, lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size as *const _ as *const c_void, std::mem::size_of_val(&ws_size));
+
+                let mut heur = std::mem::zeroed::<lt_sys::cublasLtMatmulHeuristicResult_t>();
+                let mut ret: i32 = 0;
+                let s = lt_sys::cublasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, layout_c, layout_c, pref, 1, &mut heur, &mut ret);
+                lt_sys::cublasLtMatmulPreferenceDestroy(pref);
+                if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                    lt_sys::cublasLtMatrixLayoutDestroy(layout_a);
+                    lt_sys::cublasLtMatrixLayoutDestroy(layout_b);
+                    lt_sys::cublasLtMatrixLayoutDestroy(layout_c);
+                    lt_sys::cublasLtMatmulDescDestroy(desc);
+                    return Err(LLMError::GpuError(format!("fp8 no algo: {s:?} ret={ret}")));
+                }
+                self.fp8_cache.insert(key, Fp8Plan { desc, layout_a, layout_b, layout_c, algo: heur.algo });
+            }
+        }
+
+        let plan = self.fp8_cache.get(&key).unwrap();
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
         unsafe {
             let handle = self.handle.handle();
-
-            let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-            let s = lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
-            if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                return Err(LLMError::GpuError(format!("fp8 desc create: {s:?}")));
-            }
-
-            let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-            let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
-            lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &trans_a as *const _ as *const c_void, std::mem::size_of_val(&trans_a));
-            lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &trans_b as *const _ as *const c_void, std::mem::size_of_val(&trans_b));
-
-            let mut layout_a: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut layout_b: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut layout_c: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            // A = weight[n,k] transposed, B = input[m,k], C = output[m,n]
-            // col-major: A_col[k,n], B_col[k,m], C_col[n,m]
-            lt_sys::cublasLtMatrixLayoutCreate(&mut layout_a, lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
-            lt_sys::cublasLtMatrixLayoutCreate(&mut layout_b, lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, k as u64, m as u64, k as i64);
-            lt_sys::cublasLtMatrixLayoutCreate(&mut layout_c, lt_sys::cudaDataType_t::CUDA_R_16F, n as u64, m as u64, n as i64);
-
-            let mut pref: lt_sys::cublasLtMatmulPreference_t = std::ptr::null_mut();
-            lt_sys::cublasLtMatmulPreferenceCreate(&mut pref);
-            let ws_size: usize = FP8_WORKSPACE_SIZE;
-            lt_sys::cublasLtMatmulPreferenceSetAttribute(pref, lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size as *const _ as *const c_void, std::mem::size_of_val(&ws_size));
-
-            let mut heur = std::mem::zeroed::<lt_sys::cublasLtMatmulHeuristicResult_t>();
-            let mut ret: i32 = 0;
-            let s = lt_sys::cublasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, layout_c, layout_c, pref, 1, &mut heur, &mut ret);
-            if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
-                lt_sys::cublasLtMatmulPreferenceDestroy(pref);
-                lt_sys::cublasLtMatrixLayoutDestroy(layout_a);
-                lt_sys::cublasLtMatrixLayoutDestroy(layout_b);
-                lt_sys::cublasLtMatrixLayoutDestroy(layout_c);
-                lt_sys::cublasLtMatmulDescDestroy(desc);
-                return Err(LLMError::GpuError(format!("fp8 no algo: {s:?} ret={ret}")));
-            }
-
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
-
             let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
             let s = lt_sys::cublasLtMatmul(
-                handle, desc,
+                handle, plan.desc,
                 &alpha as *const f32 as *const c_void,
-                weight_fp8_ptr as *const c_void, layout_a,   // A = weight
-                input_fp8_ptr as *const c_void, layout_b,    // B = input
+                weight_fp8_ptr as *const c_void, plan.layout_a,
+                input_fp8_ptr as *const c_void, plan.layout_b,
                 &beta as *const f32 as *const c_void,
-                output_f16_ptr as *mut c_void, layout_c,
-                output_f16_ptr as *mut c_void, layout_c,
-                &heur.algo,
-                ws_ptr as *mut c_void, ws_size,
+                output_f16_ptr as *mut c_void, plan.layout_c,
+                output_f16_ptr as *mut c_void, plan.layout_c,
+                &plan.algo,
+                ws_ptr as *mut c_void, FP8_WORKSPACE_SIZE,
                 self.stream.cu_stream(),
             );
-
-            lt_sys::cublasLtMatmulPreferenceDestroy(pref);
-            lt_sys::cublasLtMatrixLayoutDestroy(layout_a);
-            lt_sys::cublasLtMatrixLayoutDestroy(layout_b);
-            lt_sys::cublasLtMatrixLayoutDestroy(layout_c);
-            lt_sys::cublasLtMatmulDescDestroy(desc);
-
             if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                 return Err(LLMError::GpuError(format!("fp8 matmul: {s:?}")));
             }
