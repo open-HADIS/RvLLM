@@ -168,6 +168,7 @@ mod inner {
             prev_mlp_out: Option<&CudaSlice<f16>>,
             lt: Option<&crate::CublasLtRef>,
             scratch: Option<&mut LayerScratchRef<'_>>,
+            cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
         ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
             let cfg = &self.config;
             let num_tokens = input.num_tokens;
@@ -753,21 +754,25 @@ mod inner {
                     hidden_f16
                 };
 
-                // 2-3. QKV GEMM + bias: try CUTLASS fused kernel first
+                // 2-3. QKV GEMM + bias: try CUTLASS FFI first
                 if let (Some(fused_qkv), Some(bias)) = (weights.fused_qkv, weights.qkv_bias) {
-                    if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_qkv_bias", "cutlass_qkv_bias_gemm") {
-                        // CUTLASS: fused QKV GEMM + bias add in one kernel (D = A*B + bias)
+                    if let Some(ref ck) = cutlass {
+                        // CUTLASS FFI: fused QKV GEMM + bias add (self-launching)
                         let m = num_tokens as i32;
                         let n = qkv_dim as i32;
                         let k = hidden as i32;
+                        let ws_bytes = ck.qkv_bias_workspace_size(m, n, k);
+                        let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
+                            .map_err(|e| LLMError::GpuError(format!("cutlass qkv ws alloc: {e}")))?;
                         let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
-                        unsafe {
-                            self.stream.launch_builder(cutlass_fn)
-                                .arg(&mut qkv_view).arg(&*s.normed).arg(fused_qkv).arg(bias)
-                                .arg(&m).arg(&n).arg(&k)
-                                .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
-                                .map_err(|e| LLMError::GpuError(format!("cutlass qkv+bias: {e}")))?;
-                        }
+                        let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut qkv_view, &self.stream);
+                        let (in_ptr, _g1) = DevicePtr::device_ptr(&*s.normed, &self.stream);
+                        let (w_ptr, _g2) = DevicePtr::device_ptr(fused_qkv, &self.stream);
+                        let (b_ptr, _g3) = DevicePtr::device_ptr(bias, &self.stream);
+                        let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                        let stream_ptr = self.stream.cu_stream() as u64;
+                        ck.qkv_bias_gemm(out_ptr, in_ptr, w_ptr, b_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
+                            .map_err(|e| LLMError::GpuError(e))?;
                     } else {
                         // Fallback: cuBLAS GEMM + separate bias
                         Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_qkv,
@@ -859,19 +864,23 @@ mod inner {
 
                 if dbg { dbg_dump("attn_out", &attn_out, &self.stream); }
 
-                // 7-8. O projection + residual add: try CUTLASS fused kernel first
-                if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_oproj_residual", "cutlass_oproj_residual_gemm") {
-                    // CUTLASS: O-proj GEMM with residual add epilogue (D = A*B + residual)
+                // 7-8. O projection + residual add: try CUTLASS FFI first
+                if let Some(ref ck) = cutlass {
+                    // CUTLASS FFI: O-proj GEMM with residual add epilogue (self-launching)
                     let m = num_tokens as i32;
                     let n = hidden as i32;
                     let k = q_dim as i32;
-                    unsafe {
-                        self.stream.launch_builder(cutlass_fn)
-                            .arg(&mut *s.o_proj).arg(&attn_out).arg(weights.o_proj).arg(residual_ref)
-                            .arg(&m).arg(&n).arg(&k)
-                            .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("cutlass oproj+residual: {e}")))?;
-                    }
+                    let ws_bytes = ck.oproj_residual_workspace_size(m, n, k);
+                    let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
+                        .map_err(|e| LLMError::GpuError(format!("cutlass oproj ws alloc: {e}")))?;
+                    let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut *s.o_proj, &self.stream);
+                    let (in_ptr, _g1) = DevicePtr::device_ptr(&attn_out, &self.stream);
+                    let (w_ptr, _g2) = DevicePtr::device_ptr(weights.o_proj, &self.stream);
+                    let (r_ptr, _g3) = DevicePtr::device_ptr(residual_ref, &self.stream);
+                    let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    let stream_ptr = self.stream.cu_stream() as u64;
+                    ck.oproj_residual_gemm(out_ptr, in_ptr, w_ptr, r_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
+                        .map_err(|e| LLMError::GpuError(e))?;
                     // o_proj now contains GEMM + residual; copy to residual scratch, then RMSNorm
                     self.stream.memcpy_dtod(&s.o_proj.slice(..num_tokens * hidden), &mut s.residual.slice_mut(..num_tokens * hidden))
                         .map_err(|e| LLMError::GpuError(format!("oproj residual copy: {e}")))?;
@@ -886,42 +895,47 @@ mod inner {
                         cfg.rms_norm_eps, num_tokens, hidden, s.normed, s.residual)?;
                 }
 
-                // 9. Gate+up GEMM into scratch, then silu_mul into scratch
+                // 9. Gate+up GEMM + SiLU: try CUTLASS fused GateUp+SiLU first
                 if let Some(fused_gate_up) = weights.fused_gate_up {
                     let gate_up_dim = intermediate * 2;
-                    if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_gateup_silu", "cutlass_gateup_gemm") {
-                        // CUTLASS: better tiling for gate+up GEMM
+                    if let Some(ref ck) = cutlass {
+                        // CUTLASS FFI: fused GateUp GEMM + SiLU*Mul (self-launching)
+                        // Output goes directly to silu_out [M, intermediate]
                         let m = num_tokens as i32;
                         let n = gate_up_dim as i32;
                         let k = hidden as i32;
-                        unsafe {
-                            self.stream.launch_builder(cutlass_fn)
-                                .arg(&mut *s.gate_up).arg(&*s.normed).arg(fused_gate_up)
-                                .arg(&m).arg(&n).arg(&k)
-                                .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
-                                .map_err(|e| LLMError::GpuError(format!("cutlass gateup: {e}")))?;
-                        }
+                        let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
+                        let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
+                            .map_err(|e| LLMError::GpuError(format!("cutlass gateup ws alloc: {e}")))?;
+                        let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut *s.silu_out, &self.stream);
+                        let (in_ptr, _g1) = DevicePtr::device_ptr(&*s.normed, &self.stream);
+                        let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
+                        let (ws_ptr, _g3) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                        let stream_ptr = self.stream.cu_stream() as u64;
+                        ck.gateup_silu(out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
+                            .map_err(|e| LLMError::GpuError(e))?;
+                        // CUTLASS fused: output already in silu_out, skip separate silu_mul
                     } else {
-                        // Fallback: cuBLAS
+                        // Fallback: cuBLAS GEMM + separate SiLU*Mul
                         Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_gate_up,
                             num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, s.gate_up)?;
-                    }
-                    if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
-                        let n_elems = num_tokens * intermediate;
-                        let total = n_elems as u32;
-                        unsafe {
-                            self.stream.launch_builder(silu_fn)
-                                .arg(&mut *s.silu_out).arg(&*s.gate_up)
-                                .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
-                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
+                        if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
+                            let n_elems = num_tokens * intermediate;
+                            let total = n_elems as u32;
+                            unsafe {
+                                self.stream.launch_builder(silu_fn)
+                                    .arg(&mut *s.silu_out).arg(&*s.gate_up)
+                                    .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
+                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                    .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
+                            }
+                        } else {
+                            let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                            let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                            let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
+                            self.stream.memcpy_dtod(&fused, s.silu_out)
+                                .map_err(|e| LLMError::GpuError(format!("silu copy: {e}")))?;
                         }
-                    } else {
-                        let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                        let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                        let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
-                        self.stream.memcpy_dtod(&fused, s.silu_out)
-                            .map_err(|e| LLMError::GpuError(format!("silu copy: {e}")))?;
                     }
                 } else {
                     let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
@@ -967,22 +981,26 @@ mod inner {
             };
             let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
 
-            // 2-3. QKV + bias: try CUTLASS fused kernel first
+            // 2-3. QKV + bias: try CUTLASS FFI first
             let mut qkv = if let (Some(fused_qkv), Some(bias)) = (weights.fused_qkv, weights.qkv_bias) {
-                if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_qkv_bias", "cutlass_qkv_bias_gemm") {
-                    // CUTLASS: fused QKV GEMM + bias add (D = A*B + bias)
+                if let Some(ref ck) = cutlass {
+                    // CUTLASS FFI: fused QKV GEMM + bias add (self-launching)
                     let m = num_tokens as i32;
                     let n = qkv_dim as i32;
                     let k = hidden as i32;
+                    let ws_bytes = ck.qkv_bias_workspace_size(m, n, k);
+                    let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
+                        .map_err(|e| LLMError::GpuError(format!("cutlass qkv ws alloc: {e}")))?;
                     let mut qkv_out = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
                         .map_err(|e| LLMError::GpuError(format!("cutlass qkv alloc: {e}")))?;
-                    unsafe {
-                        self.stream.launch_builder(cutlass_fn)
-                            .arg(&mut qkv_out).arg(&normed).arg(fused_qkv).arg(bias)
-                            .arg(&m).arg(&n).arg(&k)
-                            .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("cutlass qkv+bias: {e}")))?;
-                    }
+                    let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut qkv_out, &self.stream);
+                    let (in_ptr, _g1) = DevicePtr::device_ptr(&normed, &self.stream);
+                    let (w_ptr, _g2) = DevicePtr::device_ptr(fused_qkv, &self.stream);
+                    let (b_ptr, _g3) = DevicePtr::device_ptr(bias, &self.stream);
+                    let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    let stream_ptr = self.stream.cu_stream() as u64;
+                    ck.qkv_bias_gemm(out_ptr, in_ptr, w_ptr, b_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
+                        .map_err(|e| LLMError::GpuError(e))?;
                     qkv_out
                 } else {
                     // Fallback: cuBLAS + separate bias
@@ -1079,21 +1097,25 @@ mod inner {
 
             if dbg { dbg_dump("attn_out", &attn_out, &self.stream); }
 
-            // 7-8. O projection + residual: try CUTLASS fused kernel first
-            let (normed2, residual) = if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_oproj_residual", "cutlass_oproj_residual_gemm") {
-                // CUTLASS: O-proj GEMM with residual add epilogue (D = A*B + residual)
+            // 7-8. O projection + residual: try CUTLASS FFI first
+            let (normed2, residual) = if let Some(ref ck) = cutlass {
+                // CUTLASS FFI: O-proj GEMM with residual add epilogue (self-launching)
                 let m = num_tokens as i32;
                 let n = hidden as i32;
                 let k = q_dim as i32;
+                let ws_bytes = ck.oproj_residual_workspace_size(m, n, k);
+                let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
+                    .map_err(|e| LLMError::GpuError(format!("cutlass oproj ws alloc: {e}")))?;
                 let mut oproj_out = unsafe { self.stream.alloc::<f16>(num_tokens * hidden) }
                     .map_err(|e| LLMError::GpuError(format!("cutlass oproj alloc: {e}")))?;
-                unsafe {
-                    self.stream.launch_builder(cutlass_fn)
-                        .arg(&mut oproj_out).arg(&attn_out).arg(weights.o_proj).arg(residual_ref)
-                        .arg(&m).arg(&n).arg(&k)
-                        .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
-                        .map_err(|e| LLMError::GpuError(format!("cutlass oproj+residual: {e}")))?;
-                }
+                let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut oproj_out, &self.stream);
+                let (in_ptr, _g1) = DevicePtr::device_ptr(&attn_out, &self.stream);
+                let (w_ptr, _g2) = DevicePtr::device_ptr(weights.o_proj, &self.stream);
+                let (r_ptr, _g3) = DevicePtr::device_ptr(residual_ref, &self.stream);
+                let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                let stream_ptr = self.stream.cu_stream() as u64;
+                ck.oproj_residual_gemm(out_ptr, in_ptr, w_ptr, r_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
+                    .map_err(|e| LLMError::GpuError(e))?;
                 // oproj_out = GEMM + residual; just RMSNorm (no separate add)
                 let normed2 = Self::rms_norm_f16(&self.stream, &self.loader, &oproj_out, post_norm_w,
                     cfg.rms_norm_eps, num_tokens, hidden)?;
@@ -1109,43 +1131,46 @@ mod inner {
             };
             let fused_act = if let Some(fused_gate_up) = weights.fused_gate_up {
                 let gate_up_dim = intermediate * 2;
-                let gu_interleaved = if let Ok(ref cutlass_fn) = self.loader.get_func("cutlass_gateup_silu", "cutlass_gateup_gemm") {
-                    // CUTLASS: better tiling for gate+up GEMM
+                if let Some(ref ck) = cutlass {
+                    // CUTLASS FFI: fused GateUp GEMM + SiLU*Mul (self-launching)
                     let m = num_tokens as i32;
                     let n = gate_up_dim as i32;
                     let k = hidden as i32;
-                    let mut gu_out = unsafe { self.stream.alloc::<f16>(num_tokens * gate_up_dim) }
+                    let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
+                    let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
+                        .map_err(|e| LLMError::GpuError(format!("cutlass gateup ws alloc: {e}")))?;
+                    let mut fused_out = unsafe { self.stream.alloc::<f16>(num_tokens * intermediate) }
                         .map_err(|e| LLMError::GpuError(format!("cutlass gateup alloc: {e}")))?;
-                    unsafe {
-                        self.stream.launch_builder(cutlass_fn)
-                            .arg(&mut gu_out).arg(&normed2).arg(fused_gate_up)
-                            .arg(&m).arg(&n).arg(&k)
-                            .launch(LaunchConfig { grid_dim: (((n as u32) + 127) / 128, ((m as u32) + 127) / 128, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("cutlass gateup: {e}")))?;
-                    }
-                    gu_out
-                } else {
-                    // Fallback: cuBLAS
-                    Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
-                        num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?
-                };
-                if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
-                    let n_elems = num_tokens * intermediate;
-                    let mut fused_out = unsafe { self.stream.alloc::<f16>(n_elems) }
-                        .map_err(|e| LLMError::GpuError(format!("silu_interleaved alloc: {e}")))?;
-                    let total = n_elems as u32;
-                    unsafe {
-                        self.stream.launch_builder(silu_fn)
-                            .arg(&mut fused_out).arg(&gu_interleaved)
-                            .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
-                            .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                            .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
-                    }
+                    let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut fused_out, &self.stream);
+                    let (in_ptr, _g1) = DevicePtr::device_ptr(&normed2, &self.stream);
+                    let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
+                    let (ws_ptr, _g3) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    let stream_ptr = self.stream.cu_stream() as u64;
+                    ck.gateup_silu(out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
+                        .map_err(|e| LLMError::GpuError(e))?;
                     fused_out
                 } else {
-                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
+                    // Fallback: cuBLAS GEMM + separate SiLU*Mul
+                    let gu_interleaved = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
+                        num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?;
+                    if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
+                        let n_elems = num_tokens * intermediate;
+                        let mut fused_out = unsafe { self.stream.alloc::<f16>(n_elems) }
+                            .map_err(|e| LLMError::GpuError(format!("silu_interleaved alloc: {e}")))?;
+                        let total = n_elems as u32;
+                        unsafe {
+                            self.stream.launch_builder(silu_fn)
+                                .arg(&mut fused_out).arg(&gu_interleaved)
+                                .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
+                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
+                        }
+                        fused_out
+                    } else {
+                        let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                        let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                        Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
+                    }
                 }
             } else {
                 let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;

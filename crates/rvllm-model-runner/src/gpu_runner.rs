@@ -132,6 +132,7 @@ mod cuda_impl {
         config: ModelRunnerConfig,
         device: Arc<CudaContext>,
         stream: Arc<CudaStream>,
+        cutlass: Option<Arc<rvllm_gpu::cutlass_ffi::CutlassKernels>>,
         layers: Vec<GpuTransformerLayer>,
         embed_tokens: CudaSlice<f16>,
         final_norm_weight: CudaSlice<f16>,
@@ -270,6 +271,37 @@ mod cuda_impl {
             #[cfg(feature = "cublaslt")]
             let blas_lt = rvllm_gpu::cublaslt_ops::CublasLtOps::new(stream.clone()).ok();
 
+            // Load CUTLASS shared library (compiled by build_cutlass_so.sh).
+            // Try arch-specific path first, then fallback paths.
+            let cutlass = {
+                use rvllm_gpu::cutlass_ffi::CutlassKernels;
+                let candidates = [
+                    "kernels/sm_90/libcutlass_kernels.so",
+                    "kernels/sm_80/libcutlass_kernels.so",
+                    "/usr/local/lib/libcutlass_kernels.so",
+                ];
+                let mut loaded = None;
+                for path in &candidates {
+                    let p = std::path::Path::new(path);
+                    if p.exists() {
+                        match CutlassKernels::load(p) {
+                            Ok(k) => {
+                                info!(?p, "CUTLASS shared library loaded");
+                                loaded = Some(Arc::new(k));
+                                break;
+                            }
+                            Err(e) => {
+                                debug!(?p, error = %e, "CUTLASS .so found but failed to load");
+                            }
+                        }
+                    }
+                }
+                if loaded.is_none() {
+                    info!("CUTLASS .so not found, using cuBLAS fallback for all GEMMs");
+                }
+                loaded
+            };
+
             Ok(Self {
                 weights,
                 cache,
@@ -280,6 +312,7 @@ mod cuda_impl {
                 config,
                 device,
                 stream,
+                cutlass,
                 layers,
                 embed_tokens,
                 final_norm_weight,
@@ -611,7 +644,7 @@ mod cuda_impl {
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
 
@@ -762,7 +795,7 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None)?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None, self.cutlass.as_deref())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -975,7 +1008,7 @@ mod cuda_impl {
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -1141,7 +1174,7 @@ mod cuda_impl {
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }

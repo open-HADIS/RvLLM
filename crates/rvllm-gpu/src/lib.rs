@@ -10,6 +10,8 @@ pub mod cpu_buffer;
 #[cfg(feature = "cuda")]
 pub mod cublas;
 #[cfg(feature = "cuda")]
+pub mod cutlass_ffi;
+#[cfg(feature = "cuda")]
 pub mod cublas_ops;
 #[cfg(feature = "cublaslt")]
 pub mod cublas_autotune;
@@ -60,6 +62,8 @@ pub mod prelude {
     pub use crate::CudaStream;
     pub use crate::cuda_graph::{padded_batch_size, CudaGraph, CudaGraphPool, GRAPH_BATCH_SIZES};
     pub use crate::device::{list_devices, GpuDevice, MemoryInfo};
+    #[cfg(feature = "cuda")]
+    pub use crate::cutlass_ffi::CutlassKernels;
     #[cfg(feature = "cuda")]
     pub use crate::kernel_loader::{launch_config, KernelLoader};
     #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]

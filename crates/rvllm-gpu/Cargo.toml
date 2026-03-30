@@ -14,7 +14,7 @@ categories = ["hardware-support", "science"]
 [features]
 default = ["mock-gpu"]
 mock-gpu = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:libloading"]
 cublaslt = ["cuda"]
 cuda-graphs = ["cuda"]
 
@@ -26,3 +26,4 @@ parking_lot.workspace = true
 tracing.workspace = true
 half.workspace = true
 cudarc = { version = "0.19", features = ["driver", "cublas", "cublaslt", "f16", "cuda-version-from-build-system"], optional = true }
+libloading = { version = "0.8", optional = true }

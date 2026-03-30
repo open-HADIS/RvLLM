@@ -78,15 +78,16 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
 extern "C" {
 
-void cutlass_oproj_residual_gemm(
-    __half* output,          // [M, N] = gemm_result + residual
-    const __half* input,     // [M, K] (attention output)
-    const __half* weight,    // [N, K] (row-major, treated as col-major for B^T)
-    const __half* residual,  // [M, N]
-    int M, int N, int K
+int cutlass_oproj_residual_gemm(
+    void* output,            // [M, N] = gemm_result + residual
+    const void* input,       // [M, K] (attention output)
+    const void* weight,      // [N, K] (row-major, treated as col-major for B^T)
+    const void* residual,    // [M, N]
+    int M, int N, int K,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream
 ) {
-    cudaStream_t stream = nullptr;
-
     auto prob_shape = cute::make_shape(M, N, K, 1);
 
     auto stride_A = cutlass::make_cute_packed_stride(
@@ -116,24 +117,15 @@ void cutlass_oproj_residual_gemm(
     Gemm gemm_op;
 
     cutlass::Status status = gemm_op.can_implement(args);
-    if (status != cutlass::Status::kSuccess) return;
-
-    // Allocate workspace
-    size_t workspace_size = gemm_op.get_workspace_size(args);
-    void* workspace = nullptr;
-    if (workspace_size > 0) {
-        cudaMalloc(&workspace, workspace_size);
-    }
+    if (status != cutlass::Status::kSuccess) return -1;
 
     status = gemm_op.initialize(args, workspace, stream);
-    if (status != cutlass::Status::kSuccess) {
-        if (workspace) cudaFree(workspace);
-        return;
-    }
+    if (status != cutlass::Status::kSuccess) return -2;
 
-    gemm_op(stream);
+    status = gemm_op(stream);
+    if (status != cutlass::Status::kSuccess) return -3;
 
-    if (workspace) cudaFree(workspace);
+    return 0;
 }
 
 size_t cutlass_oproj_residual_workspace_size(int M, int N, int K) {
