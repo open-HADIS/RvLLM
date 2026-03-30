@@ -393,7 +393,7 @@ mod inner {
                         }
                         (qkv_out, residual_out, false)
                     // f16 bias-fused variant
-                    } else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv")) {
+                    } else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("jit_add_norm_qkv", "fused_add_rmsnorm_gemv_3584x4608").or_else(|_| self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv"))) {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
@@ -595,7 +595,7 @@ mod inner {
                                     .map_err(|e| LLMError::GpuError(format!("fp8 silu_down: {e}")))?;
                             }
                             down_out
-                        } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
+                        } else if let Ok(ref sk) = self.loader.get_func("jit_silu_down", "fused_silu_mul_gemv_18944x3584").or_else(|_| self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv")) {
                             let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
                                 .map_err(|e| LLMError::GpuError(format!("silu_down alloc: {e}")))?;
                             unsafe {
@@ -656,7 +656,7 @@ mod inner {
                     } else {
                         // Fallback: separate O-proj + fused add+norm+gateup
                         let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
-                        let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv").ok();
+                        let fused_gateup_ok = self.loader.get_func("jit_add_norm_gateup", "fused_add_rmsnorm_gemv_3584x37888").or_else(|_| self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv")).ok();
                         if let Some(ref fk) = fused_gateup_ok {
                             let gate_up_dim = intermediate * 2;
                             let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
