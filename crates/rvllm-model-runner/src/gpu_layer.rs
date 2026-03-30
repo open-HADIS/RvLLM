@@ -14,6 +14,12 @@ mod inner {
     use rvllm_gpu::cublas::CublasHandle;
     use rvllm_gpu::kernel_loader::KernelLoader;
 
+    /// Autotuner context: (autotuner, workspace). None when autotuning disabled.
+    #[cfg(feature = "cublaslt")]
+    pub type AutotuneCtx<'a> = Option<(&'a rvllm_gpu::cublas_autotune::CublasAutotuner, &'a CudaSlice<u8>)>;
+    #[cfg(not(feature = "cublaslt"))]
+    pub type AutotuneCtx<'a> = Option<&'a ()>;
+
     /// Configuration for a single transformer layer.
     #[derive(Debug, Clone)]
     pub struct GpuLayerConfig {
@@ -169,6 +175,7 @@ mod inner {
             lt: Option<&crate::CublasLtRef>,
             scratch: Option<&mut LayerScratchRef<'_>>,
             cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
+            autotune: AutotuneCtx<'_>,
         ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
             let cfg = &self.config;
             let num_tokens = input.num_tokens;
@@ -442,7 +449,7 @@ mod inner {
                         let (normed, residual) = Self::fused_residual_rmsnorm_f16(
                             &self.stream, &self.loader, hidden_f16, prev_mlp, norm_w,
                             cfg.rms_norm_eps, num_tokens, hidden)?;
-                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
+                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader, autotune)?;
                         (qkv, residual, false)
                     }
                 } else {
@@ -488,7 +495,7 @@ mod inner {
                         (qkv_out, residual, false)
                     } else {
                         let normed = Self::rms_norm_f16(&self.stream, &self.loader, hidden_f16, norm_w, cfg.rms_norm_eps, 1, hidden)?;
-                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
+                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader, autotune)?;
                         let residual = hidden_f16.clone();
                         (qkv, residual, false)
                     }
@@ -611,7 +618,7 @@ mod inner {
                             down_out
                         } else {
                             let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader, autotune)?
                         };
                         (residual_out2, mlp)
                     // f16 mega kernel
@@ -653,12 +660,12 @@ mod inner {
                             down_out
                         } else {
                             let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader, autotune)?
                         };
                         (residual_out2, mlp)
                     } else {
                         // Fallback: separate O-proj + fused add+norm+gateup
-                        let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
+                        let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader, autotune)?;
                         let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv").ok();
                         if let Some(ref fk) = fused_gateup_ok {
                             let gate_up_dim = intermediate * 2;
@@ -696,7 +703,7 @@ mod inner {
                                 down_out
                             } else {
                                 let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                                Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                                Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader, autotune)?
                             };
                             (residual_out2, mlp)
                         } else {
@@ -704,10 +711,10 @@ mod inner {
                                 &self.stream, &self.loader, &residual_ref, &attn_proj, post_norm_w,
                                 cfg.rms_norm_eps, 1, hidden)?;
                             let gate_up = if let Some(fguw) = weights.fused_gate_up {
-                                Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
+                                Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader, autotune)?
                             } else {
-                                let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
-                                let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
+                                let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader, autotune)?;
+                                let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader, autotune)?;
                                 let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
                                     .map_err(|e| LLMError::GpuError(format!("concat: {e}")))?;
                                 self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate)).map_err(|e| LLMError::GpuError(format!("g: {e}")))?;
@@ -715,7 +722,7 @@ mod inner {
                                 buf
                             };
                             let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
-                            let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
+                            let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader, autotune)?;
                             (residual2, mlp)
                         }
                     }
@@ -777,7 +784,7 @@ mod inner {
                         // Fallback: cuBLAS GEMM + separate bias
                         Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_qkv,
                             num_tokens, qkv_dim, hidden, &self.loader,
-                            weights.fused_qkv_fp8, s.qkv)?;
+                            weights.fused_qkv_fp8, s.qkv, autotune)?;
                         if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
                             let total = (num_tokens * qkv_dim) as u32;
                             let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
@@ -797,13 +804,13 @@ mod inner {
                     if let Some(fused_qkv) = weights.fused_qkv {
                         Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_qkv,
                             num_tokens, qkv_dim, hidden, &self.loader,
-                            weights.fused_qkv_fp8, s.qkv)?;
+                            weights.fused_qkv_fp8, s.qkv, autotune)?;
                     } else {
                         let q_end_t = num_tokens * q_dim;
                         let k_end_t = q_end_t + num_tokens * kv_dim;
-                        { let mut d = s.qkv.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
-                        { let mut d = s.qkv.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                        { let mut d = s.qkv.slice_mut(k_end_t..k_end_t + num_tokens * kv_dim); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                        { let mut d = s.qkv.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d, autotune)?; }
+                        { let mut d = s.qkv.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d, autotune)?; }
+                        { let mut d = s.qkv.slice_mut(k_end_t..k_end_t + num_tokens * kv_dim); Self::hgemm_dispatch_into(blas, lt, &*s.normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d, autotune)?; }
                     }
                     // Bias (no CUTLASS available for separate bias case)
                     if let Some(bias) = weights.qkv_bias {
@@ -889,7 +896,7 @@ mod inner {
                 } else {
                     // Fallback: cuBLAS O-proj + fused_residual_rmsnorm
                     Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &attn_out, weights.o_proj,
-                        num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, s.o_proj)?;
+                        num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, s.o_proj, autotune)?;
                     Self::fused_residual_rmsnorm_f16_into(
                         &self.stream, &self.loader, residual_ref, &*s.o_proj, post_norm_w,
                         cfg.rms_norm_eps, num_tokens, hidden, s.normed, s.residual)?;
@@ -918,7 +925,7 @@ mod inner {
                     } else {
                         // Fallback: cuBLAS GEMM + separate SiLU*Mul
                         Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_gate_up,
-                            num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, s.gate_up)?;
+                            num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, s.gate_up, autotune)?;
                         if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
                             let n_elems = num_tokens * intermediate;
                             let total = n_elems as u32;
@@ -930,16 +937,16 @@ mod inner {
                                     .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
                             }
                         } else {
-                            let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                            let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                            let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
+                            let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
                             let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
                             self.stream.memcpy_dtod(&fused, s.silu_out)
                                 .map_err(|e| LLMError::GpuError(format!("silu copy: {e}")))?;
                         }
                     }
                 } else {
-                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
+                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
                     let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
                     self.stream.memcpy_dtod(&fused, s.silu_out)
                         .map_err(|e| LLMError::GpuError(format!("silu copy: {e}")))?;
@@ -947,7 +954,7 @@ mod inner {
 
                 // 10. Down projection into scratch
                 Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.silu_out, weights.down_proj,
-                    num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, s.down)?;
+                    num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, s.down, autotune)?;
 
                 // Return references: residual is in s.residual, mlp_out is in s.down
                 // Clone the scratch data so caller owns the returned buffers.
@@ -1006,7 +1013,7 @@ mod inner {
                     // Fallback: cuBLAS + separate bias
                     let mut q = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed, fused_qkv,
                         num_tokens, qkv_dim, hidden, &self.loader,
-                        weights.fused_qkv_fp8, None)?;
+                        weights.fused_qkv_fp8, None, autotune)?;
                     if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
                         let total = (num_tokens * qkv_dim) as u32;
                         let mut qkv_view = q.slice_mut(..num_tokens * qkv_dim);
@@ -1027,15 +1034,15 @@ mod inner {
                 let mut qkv_buf = if let Some(fused_qkv) = weights.fused_qkv {
                     Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed, fused_qkv,
                         num_tokens, qkv_dim, hidden, &self.loader,
-                        weights.fused_qkv_fp8, None)?
+                        weights.fused_qkv_fp8, None, autotune)?
                 } else {
                     let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
                         .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
                     let q_end_t = num_tokens * q_dim;
                     let k_end_t = q_end_t + num_tokens * kv_dim;
-                    { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
-                    { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
-                    { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                    { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d, autotune)?; }
+                    { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d, autotune)?; }
+                    { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d, autotune)?; }
                     qkv_buf
                 };
                 if let Some(bias) = weights.qkv_bias {
@@ -1123,7 +1130,7 @@ mod inner {
             } else {
                 // Fallback: cuBLAS O-proj + fused_residual_rmsnorm
                 let attn_proj = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &attn_out, weights.o_proj,
-                    num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, None)?;
+                    num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, None, autotune)?;
                 let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
                     &self.stream, &self.loader, residual_ref, &attn_proj, post_norm_w,
                     cfg.rms_norm_eps, num_tokens, hidden)?;
@@ -1152,7 +1159,7 @@ mod inner {
                 } else {
                     // Fallback: cuBLAS GEMM + separate SiLU*Mul
                     let gu_interleaved = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
-                        num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?;
+                        num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None, autotune)?;
                     if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
                         let n_elems = num_tokens * intermediate;
                         let mut fused_out = unsafe { self.stream.alloc::<f16>(n_elems) }
@@ -1167,18 +1174,18 @@ mod inner {
                         }
                         fused_out
                     } else {
-                        let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                        let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                        let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
+                        let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
                         Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
                     }
                 }
             } else {
-                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
+                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader, autotune)?;
                 Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
             };
             let mlp_out = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &fused_act, weights.down_proj,
-                num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, None)?;
+                num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, None, autotune)?;
             Ok((residual, mlp_out))
         }
 
@@ -1313,8 +1320,9 @@ mod inner {
             n: usize,
             k: usize,
             loader: &KernelLoader,
+            autotune: AutotuneCtx<'_>,
         ) -> Result<CudaSlice<f16>> {
-            Self::hgemm_dispatch_fp8(stream, blas, lt, input, weight, m, n, k, loader, None, None)
+            Self::hgemm_dispatch_fp8(stream, blas, lt, input, weight, m, n, k, loader, None, None, autotune)
         }
 
         /// hgemm dispatch with optional FP8 weights. When fp8_weight is provided and
@@ -1331,6 +1339,7 @@ mod inner {
             loader: &KernelLoader,
             fp8_weight: Option<&CudaSlice<u8>>,
             _fp8_input_scratch: Option<&mut CudaSlice<u8>>,
+            autotune: AutotuneCtx<'_>,
         ) -> Result<CudaSlice<f16>> {
             let mut output = unsafe { stream.alloc::<f16>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("hgemm_dispatch: {e}")))?;
@@ -1389,7 +1398,15 @@ mod inner {
 
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
-                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                // Autotuned algo: use pre-selected algorithm with workspace
+                if let Some((tuner, ws)) = autotune.as_ref() {
+                    if let Some(entry) = tuner.get(m, n, k) {
+                        lt_ops.hgemm_a_bt_with_algo(m, n, k, 1.0, input, weight, 0.0, &mut output, &entry.algo, ws)?;
+                        return Ok(output);
+                    }
+                }
+                let threshold = if autotune.is_some() { 512 } else { rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD };
+                if m <= threshold {
                     lt_ops.hgemm_a_bt(m, n, k, 1.0, input, weight, 0.0, &mut output)?;
                     return Ok(output);
                 }
@@ -1411,6 +1428,7 @@ mod inner {
             loader: &KernelLoader,
             fp8_weight: Option<&CudaSlice<u8>>,
             output: &mut CudaSlice<f16>,
+            autotune: AutotuneCtx<'_>,
         ) -> Result<()> {
             // FP8 path
             #[cfg(feature = "cublaslt")]
@@ -1441,7 +1459,14 @@ mod inner {
 
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
-                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                if let Some((tuner, ws)) = autotune.as_ref() {
+                    if let Some(entry) = tuner.get(m, n, k) {
+                        lt_ops.hgemm_a_bt_with_algo(m, n, k, 1.0, input, weight, 0.0, output, &entry.algo, ws)?;
+                        return Ok(());
+                    }
+                }
+                let threshold = if autotune.is_some() { 512 } else { rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD };
+                if m <= threshold {
                     lt_ops.hgemm_a_bt(m, n, k, 1.0, input, weight, 0.0, output)?;
                     return Ok(());
                 }
@@ -1461,13 +1486,16 @@ mod inner {
             n: usize,
             k: usize,
             out: &mut CudaViewMut<'_, f16>,
+            autotune: AutotuneCtx<'_>,
         ) -> Result<()> {
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
-                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                let threshold = if autotune.is_some() { 512 } else { rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD };
+                if m <= threshold {
                     return lt_ops.hgemm_a_bt_into(m, n, k, 1.0, input, weight, 0.0, out);
                 }
             }
+            let _ = autotune; // suppress unused warning when cublaslt off
             blas.hgemm_into(m, n, k, 1.0, input, weight, 0.0, out)
         }
 

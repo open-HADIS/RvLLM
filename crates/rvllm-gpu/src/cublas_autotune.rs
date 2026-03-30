@@ -344,38 +344,43 @@ impl CublasAutotuner {
         }
     }
 
-    /// Autotune all GEMM shapes for Qwen2.5-7B at M=1 and M=128.
-    pub fn autotune_model(lt_ops: &CublasLtOps, dtype: GemmDtype) -> Result<Self> {
-        let shapes: &[(usize, usize, usize)] = &[
-            // QKV projection
-            (1, 4608, 3584),
-            (128, 4608, 3584),
-            // O-proj
-            (1, 3584, 3584),
-            (128, 3584, 3584),
-            // GateUp
-            (1, 37888, 3584),
-            (128, 37888, 3584),
-            // Down
-            (1, 3584, 18944),
-            (128, 3584, 18944),
+    /// Autotune all GEMM shapes for the model config at CUDA graph bucket sizes.
+    pub fn autotune_model(
+        lt_ops: &CublasLtOps,
+        dtype: GemmDtype,
+        hidden: usize,
+        q_dim: usize,
+        qkv_dim: usize,
+        intermediate: usize,
+        gate_up_dim: usize,
+    ) -> Result<Self> {
+        // CUDA graph bucket sizes -- same M values used in decode batching
+        let ms: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
+        // (n, k) shapes for each projection type
+        let nk_shapes: &[(usize, usize)] = &[
+            (qkv_dim, hidden),        // QKV
+            (hidden, q_dim),           // O-proj
+            (gate_up_dim, hidden),     // GateUp
+            (hidden, intermediate),    // Down
         ];
 
         let mut tuner = Self::new();
-        for &(m, n, k) in shapes {
-            tracing::info!(m, n, k, ?dtype, "autotune start");
-            match Self::autotune_shape(lt_ops, m, n, k, dtype) {
-                Ok(result) => {
-                    tracing::info!(
-                        m, n, k,
-                        time_us = result.time_us,
-                        ws = result.workspace_size,
-                        "autotune best algo"
-                    );
-                    tuner.results.insert((m, n, k), result);
-                }
-                Err(e) => {
-                    tracing::warn!(m, n, k, %e, "autotune failed");
+        for &m in ms {
+            for &(n, k) in nk_shapes {
+                tracing::info!(m, n, k, ?dtype, "autotune start");
+                match Self::autotune_shape(lt_ops, m, n, k, dtype) {
+                    Ok(result) => {
+                        tracing::info!(
+                            m, n, k,
+                            time_us = result.time_us,
+                            ws = result.workspace_size,
+                            "autotune best algo"
+                        );
+                        tuner.results.insert((m, n, k), result);
+                    }
+                    Err(e) => {
+                        tracing::warn!(m, n, k, %e, "autotune failed");
+                    }
                 }
             }
         }
@@ -394,5 +399,10 @@ impl CublasAutotuner {
 
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
+    }
+
+    /// Max workspace size across all autotuned algos (for pre-allocation).
+    pub fn max_workspace_size(&self) -> usize {
+        self.results.values().map(|a| a.workspace_size).max().unwrap_or(0)
     }
 }

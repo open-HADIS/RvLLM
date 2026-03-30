@@ -128,6 +128,10 @@ mod cuda_impl {
         blas: CublasHandle,
         #[cfg(feature = "cublaslt")]
         blas_lt: Option<rvllm_gpu::cublaslt_ops::CublasLtOps>,
+        #[cfg(feature = "cublaslt")]
+        autotuner: Option<rvllm_gpu::cublas_autotune::CublasAutotuner>,
+        #[cfg(feature = "cublaslt")]
+        autotune_workspace: Option<CudaSlice<u8>>,
         loader: Arc<KernelLoader>,
         config: ModelRunnerConfig,
         device: Arc<CudaContext>,
@@ -308,6 +312,10 @@ mod cuda_impl {
                 blas,
                 #[cfg(feature = "cublaslt")]
                 blas_lt,
+                #[cfg(feature = "cublaslt")]
+                autotuner: None,
+                #[cfg(feature = "cublaslt")]
+                autotune_workspace: None,
                 loader,
                 config,
                 device,
@@ -500,6 +508,30 @@ mod cuda_impl {
                 info!(num_layers, "FP8 weight quantization complete (all projections)");
             }
 
+            // Autotune cublasLt algorithms for all GEMM shapes
+            #[cfg(feature = "cublaslt")]
+            if let Some(ref lt_ops) = self.blas_lt {
+                use rvllm_gpu::cublas_autotune::{CublasAutotuner, GemmDtype};
+                match CublasAutotuner::autotune_model(
+                    lt_ops, GemmDtype::F16,
+                    hidden, q_dim, qkv_dim, intermediate, gate_up_dim,
+                ) {
+                    Ok(tuner) => {
+                        let max_ws = tuner.max_workspace_size();
+                        info!(num_shapes = tuner.len(), max_ws, "cuBLAS autotuning complete");
+                        let ws_alloc = std::cmp::max(max_ws, 1); // at least 1 byte so ctx is Some
+                        self.autotune_workspace = Some(
+                            unsafe { self.stream.alloc::<u8>(ws_alloc) }
+                                .map_err(|e| LLMError::GpuError(format!("autotune ws alloc: {e}")))?
+                        );
+                        self.autotuner = Some(tuner);
+                    }
+                    Err(e) => {
+                        warn!("cuBLAS autotuning failed: {e} -- using default heuristics");
+                    }
+                }
+            }
+
             self.alloc_scratch()?;
             Ok(())
         }
@@ -644,7 +676,7 @@ mod cuda_impl {
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref(), self.autotune_ctx())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
 
@@ -795,7 +827,7 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None, self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None, self.cutlass.as_deref(), self.autotune_ctx())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -1008,7 +1040,7 @@ mod cuda_impl {
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref(), self.autotune_ctx())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -1062,6 +1094,19 @@ mod cuda_impl {
         fn cublaslt_ref(&self) -> Option<&crate::CublasLtRef> {
             #[cfg(feature = "cublaslt")]
             { self.blas_lt.as_ref() }
+            #[cfg(not(feature = "cublaslt"))]
+            { None }
+        }
+
+        /// Get autotuner context (autotuner + workspace) for dispatch.
+        fn autotune_ctx(&self) -> crate::gpu_layer::AutotuneCtx<'_> {
+            #[cfg(feature = "cublaslt")]
+            {
+                match (self.autotuner.as_ref(), self.autotune_workspace.as_ref()) {
+                    (Some(t), Some(ws)) => Some((t, ws)),
+                    _ => None,
+                }
+            }
             #[cfg(not(feature = "cublaslt"))]
             { None }
         }
@@ -1174,7 +1219,7 @@ mod cuda_impl {
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref(), self.autotune_ctx())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
