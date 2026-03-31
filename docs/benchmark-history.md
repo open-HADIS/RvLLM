@@ -7,8 +7,9 @@ All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-
 Binary built with `--features cuda,cublaslt`. Fixed cublaslt_raw module registration,
 FFI type mismatches, RefCell plan cache. Direct engine benchmark.
 
-NOTE: CUTE JIT kernels failed (missing cute/tensor.hpp on instance), so rvLLM ran
-non-fused fallback paths. This explains the ~2x gap vs vLLM.
+CUTLASS headers installed, 4 fused CuTE kernels loaded from JIT cache.
+The ~2x gap is real -- vLLM's FlashAttention v3 + Triton fused ops + mature
+continuous batching scheduler dominate at high concurrency on 7B.
 
 ### Qwen2.5-7B f16 -- rvLLM vs vLLM 0.18 (512 tok/req, same H100)
 
