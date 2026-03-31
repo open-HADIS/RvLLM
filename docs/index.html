@@ -97,7 +97,7 @@ footer a:hover{color:#999}
 
 <div class="hero">
   <div class="big">12,312 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. JIT fused kernels 2-7.5x faster than hand-written CUDA.</div>
+  <div class="sub">Qwen2.5-7B on H100. 0.85x vLLM direct engine. FA3 v3 cp.async + split-KV. No-fallback kernel validation. JIT fused kernels 2-7.5x faster than hand-written CUDA.</div>
 </div>
 
 <section>
@@ -112,8 +112,8 @@ footer a:hover{color:#999}
 </p>
 <p>
   On H100 SXM 80GB serving Qwen2.5-7B f16, rvLLM achieves <strong>12,312 tok/s at N=128</strong>
-  (direct engine) with FA3 v3 cp.async attention and no-fallback kernel validation.
-  HTTP comparison: <strong>0.88x vLLM at N=16</strong>, <strong>0.67x at N=128</strong>.
+  (direct engine, <strong>0.85x vLLM</strong>). Direct engine gap: 0.82--0.96x (near parity at N=16/64).
+  HTTP comparison: 0.67--0.88x.
   20x faster startup, 31x smaller binary, 3x less CPU memory, and 5.6x tighter P95 latency.
   The JIT compiler generates shape-specialized fused kernels (RMSNorm+GEMV, SiLU*Mul+Down,
   Add+RMSNorm+GateUp) that are <strong>2-7.5x faster</strong> than the hand-written CUDA equivalents
