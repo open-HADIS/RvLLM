@@ -39,7 +39,8 @@ mod cuda_impl {
     use crate::runner::ModelRunnerConfig;
 
     use crate::gpu_layer::{
-        GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef,
+        ForwardPath, GemmStrategy, GpuLayerConfig, GpuLayerInput, GpuLayerWeights,
+        GpuTransformerLayer, LayerScratchRef,
     };
     use crate::layers::linear_cuda::CudaLinearLayer;
 
@@ -137,6 +138,7 @@ mod cuda_impl {
         device: Arc<CudaContext>,
         stream: Arc<CudaStream>,
         cutlass: Option<Arc<rvllm_gpu::cutlass_ffi::CutlassKernels>>,
+        gemm_strategy: GemmStrategy,
         layers: Vec<GpuTransformerLayer>,
         embed_tokens: CudaSlice<f16>,
         final_norm_weight: CudaSlice<f16>,
@@ -316,6 +318,7 @@ mod cuda_impl {
                 config,
                 device,
                 stream,
+                gemm_strategy: if cutlass.is_some() { GemmStrategy::Cutlass } else { GemmStrategy::Cublas },
                 cutlass,
                 layers,
                 embed_tokens,
@@ -627,18 +630,15 @@ mod cuda_impl {
                 }
             }
 
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
 
                 // Double-buffer: even layers write A read B, odd write B read A.
-                // For the first layer (0), hidden_states comes from residual_a (embedding copy above),
-                // prev_mlp_out is None. Layer writes to residual_b/down_b.
-                // Layer 1 reads residual_b/down_b, writes to residual_a/down_a. Etc.
                 let use_double_buf = use_scratch && scratch_borrow.is_some();
                 let (scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_double_buf {
                     let s = scratch_borrow.as_mut().unwrap();
                     let even = layer_idx % 2 == 0;
-                    // Write targets (residual/down) and read sources alternate
                     let (write_res, write_down, read_res, read_down) = if even {
                         (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
                     } else {
@@ -654,7 +654,6 @@ mod cuda_impl {
                         gate_up: &mut s.gate_up,
                         silu_out: &mut s.silu_out,
                         down: write_down,
-                        zero_copy: true,
                     }), read_res as &CudaSlice<f16>, pmo)
                 } else {
                     (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
@@ -684,9 +683,9 @@ mod cuda_impl {
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let mut scratch_ref = scratch_ref_opt;
-                let result = layer.forward(&input, &weights, &self.blas,
+                let result = layer.forward(path, &input, &weights, &self.blas,
                     if use_double_buf { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                    self.cublaslt_ref(), scratch_ref.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
                 if let Some((residual, mlp_out)) = result {
                     // Non-scratch path: take ownership
                     hidden_f16 = residual;
@@ -839,11 +838,50 @@ mod cuda_impl {
             let max_context_len = attn_meta.max_context_len;
             let layers_to_run = max_layers.min(self.layers.len());
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            let use_scratch = num_tokens > 1 && !is_prefill;
+            let mut scratch_borrow = self.f16_scratch.borrow_mut();
+
+            // For Batched path: copy embedding into residual_a for double-buffer read
+            if use_scratch {
+                if let Some(ref mut s) = *scratch_borrow {
+                    self.stream.memcpy_dtod(&hidden_f16, &mut s.residual_a.slice_mut(..num_tokens * hidden_size))
+                        .map_err(|e| LLMError::GpuError(format!("partial embed->scratch: {e}")))?;
+                }
+            }
 
             for (layer_idx, layer) in self.layers.iter().take(layers_to_run).enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
+
+                let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
+                    if let Some(ref mut s) = *scratch_borrow {
+                        let even = layer_idx % 2 == 0;
+                        let (write_res, write_down, read_res, read_down) = if even {
+                            (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
+                        } else {
+                            (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
+                        };
+                        let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
+                        let hs: &CudaSlice<f16> = if layer_idx > 0 { read_res } else { &hidden_f16 };
+                        (Some(LayerScratchRef {
+                            normed: &mut s.normed,
+                            residual: write_res,
+                            qkv: &mut s.qkv,
+                            attn_out: &mut s.attn_out,
+                            o_proj: &mut s.o_proj,
+                            gate_up: &mut s.gate_up,
+                            silu_out: &mut s.silu_out,
+                            down: write_down,
+                        }), hs, pmo)
+                    } else {
+                        return Err(LLMError::GpuError("Batched path requires scratch buffers".into()));
+                    }
+                } else {
+                    (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
+                };
+
                 let input = GpuLayerInput {
-                    hidden_states: &hidden_f16,
+                    hidden_states: hs_ref,
                     positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
@@ -865,10 +903,36 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None, self.cutlass.as_deref())?
-                    .expect("non-scratch forward must return data");
-                hidden_f16 = residual;
-                prev_mlp_out = Some(mlp_out);
+                let result = layer.forward(path, &input, &weights, &self.blas,
+                    if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
+                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
+                if let Some((residual, mlp_out)) = result {
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
+                }
+            }
+
+            // Extract final results from scratch double-buffer
+            if use_scratch {
+                if let Some(ref s) = *scratch_borrow {
+                    let last_even = (layers_to_run - 1) % 2 == 0;
+                    let (res_src, down_src) = if last_even {
+                        (&s.residual_b, &s.down_b)
+                    } else {
+                        (&s.residual_a, &s.down_a)
+                    };
+                    let n = num_tokens * hidden_size;
+                    let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("partial final res: {e}")))?;
+                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                        .map_err(|e| LLMError::GpuError(format!("partial final res dtod: {e}")))?;
+                    hidden_f16 = res_out;
+                    let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("partial final mlp: {e}")))?;
+                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                        .map_err(|e| LLMError::GpuError(format!("partial final mlp dtod: {e}")))?;
+                    prev_mlp_out = Some(down_out);
+                }
             }
 
             // Final norm + LM head (same as full forward)
@@ -1036,17 +1100,15 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            // Use scratch buffers for T>1 decode to eliminate per-layer allocations.
-            // Double-buffered: even layers write to (residual_b, down_b), odd to (a, a).
-            // zero_copy=true eliminates per-layer clone (56 allocs + 56 D2D copies for 28 layers).
+            // Double-buffered scratch for T>1 decode: zero per-layer allocations.
             let use_scratch = num_tokens > 1 && !is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let even = layer_idx % 2 == 0;
 
-                // Double-buffer: build scratch ref with write-side, read hidden/mlp from read-side
                 let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let (write_res, write_down, read_res, read_down) = if even {
@@ -1065,7 +1127,6 @@ mod cuda_impl {
                             gate_up: &mut s.gate_up,
                             silu_out: &mut s.silu_out,
                             down: write_down,
-                            zero_copy: true,
                         }), hs, pmo)
                     } else {
                         (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
@@ -1097,14 +1158,13 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let result = layer.forward(&input, &weights, &self.blas,
+                let result = layer.forward(path, &input, &weights, &self.blas,
                     if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.cutlass.as_deref())?;
+                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
                 if let Some((residual, mlp_out)) = result {
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
-                // zero_copy: results in scratch write-side, next iteration reads via double-buffer swap
             }
 
             // Double-buffer: extract final layer results (1 copy at end, not per-layer)
@@ -1183,6 +1243,20 @@ mod cuda_impl {
             { None }
         }
 
+        fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
+            if num_tokens == 1 && !is_prefill {
+                #[cfg(feature = "cublaslt")]
+                if self.blas_lt.is_some()
+                    && self.weights.has_fp8_weights()
+                    && self.fp8_input_scratch.is_some()
+                {
+                    return ForwardPath::Fp8Decode;
+                }
+                ForwardPath::FusedDecode
+            } else {
+                ForwardPath::Batched
+            }
+        }
 
         /// Prepare the runner for CUDA graph capture.
         ///
@@ -1246,18 +1320,15 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            // NOTE: No profiling in forward_gpu_only -- this is captured into CUDA graphs.
-            // stream.synchronize() during capture would invalidate the graph.
-            // Double-buffered scratch: even layers write (residual_b, down_b), odd write (a, a).
-            // zero_copy=true eliminates per-layer clone (56 allocs + 56 D2D copies for 28 layers).
+            // Double-buffered scratch for T>1 decode: zero per-layer allocations.
             let use_scratch = num_tokens > 1 && !is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let even = layer_idx % 2 == 0;
 
-                // Double-buffer: write-side for this layer, read-side from previous layer
                 let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let (write_res, write_down, read_res, read_down) = if even {
@@ -1276,7 +1347,6 @@ mod cuda_impl {
                             gate_up: &mut s.gate_up,
                             silu_out: &mut s.silu_out,
                             down: write_down,
-                            zero_copy: true,
                         }), hs, pmo)
                     } else {
                         (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
@@ -1308,9 +1378,9 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let result = layer.forward(&input, &weights, &self.blas,
+                let result = layer.forward(path, &input, &weights, &self.blas,
                     if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.cutlass.as_deref())?;
+                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
                 if let Some((residual, mlp_out)) = result {
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
@@ -1458,77 +1528,6 @@ mod cuda_impl {
                     .arg(&(vocab_size as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("argmax_kernel launch: {e}")))?;
-            }
-
-            Ok(output)
-        }
-
-        /// Fused LM-head matvec + argmax for single-token greedy decode (f32 weights).
-        /// Skips materializing the full [vocab_size] logits tensor entirely.
-        fn gpu_fused_lm_head_argmax(
-            &self,
-            hidden_state: &CudaSlice<f32>,
-            weight: &CudaSlice<f32>,
-            vocab_size: usize,
-            hidden_size: usize,
-        ) -> Result<CudaSlice<i32>> {
-            let pass1 = self
-                .loader
-                .get_func("fused_lm_head_argmax", "fused_lm_head_argmax_kernel")?;
-            let pass2 = self
-                .loader
-                .get_func("fused_lm_head_argmax", "fused_lm_head_argmax_reduce_kernel")?;
-
-            let num_blocks = (vocab_size + 255) / 256;
-
-            let partial_val: CudaSlice<f32> = self
-                .stream
-                .alloc_zeros::<f32>(num_blocks)
-                .map_err(|e| LLMError::GpuError(format!("fused_lm_head partial_val alloc: {e}")))?;
-            let partial_idx: CudaSlice<i32> = self
-                .stream
-                .alloc_zeros::<i32>(num_blocks)
-                .map_err(|e| LLMError::GpuError(format!("fused_lm_head partial_idx alloc: {e}")))?;
-            let output: CudaSlice<i32> = self
-                .stream
-                .alloc_zeros::<i32>(1)
-                .map_err(|e| LLMError::GpuError(format!("fused_lm_head output alloc: {e}")))?;
-
-            // Pass 1: per-block dot + local argmax
-            let cfg1 = LaunchConfig {
-                grid_dim: (num_blocks as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: (hidden_size * std::mem::size_of::<f32>()) as u32,
-            };
-            unsafe {
-                self.stream
-                    .launch_builder(&pass1)
-                    .arg(weight)
-                    .arg(hidden_state)
-                    .arg(&partial_val)
-                    .arg(&partial_idx)
-                    .arg(&(vocab_size as i32))
-                    .arg(&(hidden_size as i32))
-                    .launch(cfg1)
-                    .map_err(|e| LLMError::GpuError(format!("fused_lm_head_argmax_kernel launch: {e}")))?;
-            }
-
-            // Pass 2: reduce partials to single token ID
-            let reduce_threads = num_blocks.min(1024) as u32;
-            let cfg2 = LaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (reduce_threads, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.stream
-                    .launch_builder(&pass2)
-                    .arg(&partial_val)
-                    .arg(&partial_idx)
-                    .arg(&output)
-                    .arg(&(num_blocks as i32))
-                    .launch(cfg2)
-                    .map_err(|e| LLMError::GpuError(format!("fused_lm_head_argmax_reduce_kernel launch: {e}")))?;
             }
 
             Ok(output)
@@ -1707,35 +1706,6 @@ mod cuda_impl {
                     .map_err(|e| LLMError::GpuError(format!("rms_norm_f16 launch: {e}")))?;
             }
             Ok(output)
-        }
-
-        /// In-place RMSNorm f16: normalizes `input` directly, no output allocation.
-        fn rms_norm_f16_inplace_runner(
-            &self,
-            input: &mut CudaSlice<f16>,
-            weight: &CudaSlice<f16>,
-            hidden_size: usize,
-        ) -> Result<()> {
-            let num_tokens = input.len() / hidden_size;
-            let block_threads = hidden_size.min(1024) as u32;
-            let cfg = LaunchConfig {
-                grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (block_threads, 1, 1),
-                shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
-            };
-            let kernel = self.loader.get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
-            unsafe {
-                let (raw_ptr, _guard) = DevicePtrMut::device_ptr_mut(input, &self.stream);
-                self.stream.launch_builder(&kernel)
-                    .arg(&raw_ptr)
-                    .arg(&raw_ptr)
-                    .arg(weight)
-                    .arg(&self.rms_norm_eps)
-                    .arg(&(hidden_size as i32))
-                    .launch(cfg)
-                    .map_err(|e| LLMError::GpuError(format!("rms_norm_f16_inplace launch: {e}")))?;
-            }
-            Ok(())
         }
 
         /// Fused LM-head matvec + argmax for single-token greedy decode (f16 weights, f16 hidden).
