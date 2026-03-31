@@ -626,12 +626,10 @@ mod inner {
                         }
                         (qkv_out, residual_out, false)
                     } else {
-                        // Fallback: separate add+norm then QKV
-                        let (normed, residual) = Self::fused_residual_rmsnorm_f16(
-                            &self.stream, &self.loader, hidden_f16, prev_mlp, norm_w,
-                            cfg.rms_norm_eps, num_tokens, hidden)?;
-                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
-                        (qkv, residual, false)
+                        return Err(LLMError::GpuError(
+                            "No fused add+norm+QKV GEMV kernel loaded. Required: fused_cute_add_norm_qkv_gemv or bias variant. \
+                             Ensure kernels are compiled with CUTLASS headers available.".into()
+                        ));
                     }
                 } else {
                     // First layer: norm+QKV GEMV
@@ -675,10 +673,9 @@ mod inner {
                         let residual = hidden_f16.clone();
                         (qkv_out, residual, false)
                     } else {
-                        let normed = Self::rms_norm_f16(&self.stream, &self.loader, hidden_f16, norm_w, cfg.rms_norm_eps, 1, hidden)?;
-                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
-                        let residual = hidden_f16.clone();
-                        (qkv, residual, false)
+                        return Err(LLMError::GpuError(
+                            "No fused norm+QKV GEMV kernel loaded (first layer). Required: fused_cute_norm_qkv_gemv or bias variant.".into()
+                        ));
                     }
                 };
 
@@ -693,14 +690,16 @@ mod inner {
 
                 prof!("qkv_bias");
                 // --- Step 4+5: Fused RoPE + KV cache write ---
-                if let Ok(ref fk) = self.loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel") {
+                {
+                    let fk = self.loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel")
+                        .map_err(|e| LLMError::GpuError(format!("Required fused_rope_cache kernel missing: {e}")))?;
                     let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_dim);
                     let (mut k_part, v_part) = kv_rest.split_at_mut(kv_dim);
                     let v_view = v_part.slice(..kv_dim);
                     let half_dim = head_dim / 2;
                     let grid_y = num_heads.max(num_kv_heads) as u32;
                     unsafe {
-                        self.stream.launch_builder(fk)
+                        self.stream.launch_builder(&fk)
                             .arg(&mut q_part).arg(&mut k_part).arg(&v_view)
                             .arg(input.key_cache).arg(input.value_cache)
                             .arg(input.rope_cos).arg(input.rope_sin)
@@ -709,24 +708,6 @@ mod inner {
                             .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
                             .launch(LaunchConfig { grid_dim: (num_tokens as u32, grid_y, 1), block_dim: (half_dim.min(1024) as u32, 1, 1), shared_mem_bytes: 0 })
                             .map_err(|e| LLMError::GpuError(format!("fused rope+cache: {e}")))?;
-                    }
-                } else {
-                    // Fallback: separate RoPE then cache write
-                    {
-                        let (mut q_part, mut kv_part) = qkv.split_at_mut(q_dim);
-                        let mut k_view = kv_part.slice_mut(..kv_dim);
-                        Self::apply_rotary_embedding_f16_views(
-                            &self.stream, &self.loader, &mut q_part, &mut k_view,
-                            &input.positions, input.rope_cos, input.rope_sin,
-                            num_tokens, num_heads, num_kv_heads, head_dim)?;
-                    }
-                    {
-                        let k_view = qkv.slice(q_dim..q_dim + kv_dim);
-                        let v_view = qkv.slice(q_dim + kv_dim..);
-                        Self::cache_write_f16_views(
-                            &self.stream, &self.loader, &k_view, &v_view,
-                            input.key_cache, input.value_cache, &input.slot_mapping,
-                            num_tokens, num_kv_heads, head_dim)?;
                     }
                 }
 
@@ -857,23 +838,10 @@ mod inner {
                             };
                             (residual_out2, mlp)
                         } else {
-                            let (normed2, residual2) = Self::fused_residual_rmsnorm_f16(
-                                &self.stream, &self.loader, &residual_ref, &attn_proj, post_norm_w,
-                                cfg.rms_norm_eps, 1, hidden)?;
-                            let gate_up = if let Some(fguw) = weights.fused_gate_up {
-                                Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
-                            } else {
-                                let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
-                                let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
-                                let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
-                                    .map_err(|e| LLMError::GpuError(format!("concat: {e}")))?;
-                                self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate)).map_err(|e| LLMError::GpuError(format!("g: {e}")))?;
-                                self.stream.memcpy_dtod(&u, &mut buf.slice_mut(intermediate..)).map_err(|e| LLMError::GpuError(format!("u: {e}")))?;
-                                buf
-                            };
-                            let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
-                            let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
-                            (residual2, mlp)
+                            return Err(LLMError::GpuError(
+                                "No fused MLP kernels loaded (T=1). Required: fused_cute_oproj_add_norm_gateup_gemv \
+                                 or fused_cute_add_norm_gateup_gemv + fused_cute_silu_down_gemv.".into()
+                            ));
                         }
                     }
                 };
@@ -1941,7 +1909,8 @@ mod inner {
 
             // v3 GQA kernel (requires head_dim % 8 == 0 for cp.async 16-byte alignment)
             if num_heads != num_kv_heads && heads_per_group <= 8 && head_dim % 8 == 0 {
-                if let Ok(v3_gqa) = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_gqa_kernel") {
+                let v3_gqa = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_gqa_kernel")?;
+                {
                     const V3_BC: usize = 64;
                     const V3_THREADS: u32 = 256;
                     const V3_MAX_HPG: usize = 8;
@@ -2030,9 +1999,10 @@ mod inner {
                 }
             }
 
-            // v3 non-GQA kernel (MHA fallback with cp.async)
+            // v3 non-GQA kernel (MHA with cp.async)
             if head_dim % 8 == 0 {
-                if let Ok(v3_kernel) = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_kernel") {
+                let v3_kernel = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_kernel")?;
+                {
                     const V3_BC: usize = 64;
                     const V3_THREADS: u32 = 256;
                     let smem = V3_BC * head_dim * std::mem::size_of::<u16>()
@@ -2108,117 +2078,11 @@ mod inner {
                 }
             }
 
-            // ---- Fallback: FA3 v2 GQA ----
-            if num_heads != num_kv_heads && heads_per_group <= 8 {
-                if let Ok(gqa_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_gqa_f16io_kernel") {
-                    const GQA_BC: usize = 64;
-                    const GQA_THREADS: u32 = 256;
-                    const GQA_MAX_HPG: usize = 8;
-                    const GQA_SCORE_STRIDE: usize = GQA_BC + 1;
-                    let gqa_kv_stride = head_dim + 2;
-                    let smem = GQA_BC * gqa_kv_stride * std::mem::size_of::<u16>()
-                             + GQA_MAX_HPG * GQA_SCORE_STRIDE * std::mem::size_of::<f32>()
-                             + 8 * std::mem::size_of::<f32>();
-                    let shared_mem_bytes = smem as u32;
-                    let p_max_context = max_context_len as i32;
-                    let cfg = LaunchConfig {
-                        grid_dim: (num_seqs as u32, num_kv_heads as u32, 1),
-                        block_dim: (GQA_THREADS, 1, 1),
-                        shared_mem_bytes,
-                    };
-                    if shared_mem_bytes > 49152 {
-                        gqa_kernel.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            shared_mem_bytes as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("FA3 GQA set max shared mem: {e}")))?;
-                    }
-                    unsafe {
-                        stream.launch_builder(&gqa_kernel)
-                            .arg(&mut output)
-                            .arg(q)
-                            .arg(key_cache).arg(value_cache)
-                            .arg(block_tables).arg(context_lens)
-                            .arg(&scale)
-                            .arg(&p_num_heads).arg(&p_num_kv_heads)
-                            .arg(&p_head_dim).arg(&p_block_size)
-                            .arg(&p_max_context)
-                            .arg(&p_max_blocks)
-                            .launch(cfg)
-                            .map_err(|e| LLMError::GpuError(format!("FA3 GQA decode launch: {e}")))?;
-                    }
-                    return Ok(output);
-                }
-            }
-
-            // Fallback: FA3 v2 non-GQA
-            if let Ok(fa3_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_f16io_kernel") {
-                const FA3_BC: usize = 64;
-                const FA3_THREADS: u32 = 256;
-                let fa3_kv_stride = head_dim + 2;
-                let smem = FA3_BC * fa3_kv_stride * std::mem::size_of::<u16>()
-                         + (FA3_BC + 8) * std::mem::size_of::<f32>();
-                let shared_mem_bytes = smem as u32;
-                let cfg = LaunchConfig {
-                    grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                    block_dim: (FA3_THREADS, 1, 1),
-                    shared_mem_bytes,
-                };
-                if shared_mem_bytes > 49152 {
-                    fa3_kernel.set_attribute(
-                        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        shared_mem_bytes as i32,
-                    ).map_err(|e| LLMError::GpuError(format!("FA3 set max shared mem: {e}")))?;
-                }
-                unsafe {
-                    stream.launch_builder(&fa3_kernel)
-                        .arg(&mut output)
-                        .arg(q)
-                        .arg(key_cache).arg(value_cache)
-                        .arg(block_tables).arg(context_lens)
-                        .arg(&scale)
-                        .arg(&p_num_heads).arg(&p_num_kv_heads)
-                        .arg(&p_head_dim).arg(&p_block_size)
-                        .arg(&p_max_blocks)
-                        .launch(cfg)
-                        .map_err(|e| LLMError::GpuError(format!("FA3 decode launch: {e}")))?;
-                }
-                return Ok(output);
-            }
-            // Fallback: FA2 kernel
-            const FA2_BC: usize = 64;
-            const FA2_THREADS: u32 = 128;
-            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32))
-                * std::mem::size_of::<f32>()) as u32;
-
-            let kernel = loader.get_func("flash_attention", "flash_attention_2_decode_f16io_kernel")?;
-
-            let cfg = LaunchConfig {
-                grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                block_dim: (FA2_THREADS, 1, 1),
-                shared_mem_bytes,
-            };
-
-            if shared_mem_bytes > 49152 {
-                kernel.set_attribute(
-                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    shared_mem_bytes as i32,
-                ).map_err(|e| LLMError::GpuError(format!("FA2 set max shared mem: {e}")))?;
-            }
-
-            unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(&mut output)
-                    .arg(q)
-                    .arg(key_cache).arg(value_cache)
-                    .arg(block_tables).arg(context_lens)
-                    .arg(&scale)
-                    .arg(&p_num_heads).arg(&p_num_kv_heads)
-                    .arg(&p_head_dim).arg(&p_block_size)
-                    .arg(&p_max_blocks)
-                    .launch(cfg)
-                    .map_err(|e| LLMError::GpuError(format!("FA2 decode f16io launch: {e}")))?;
-            }
-            Ok(output)
+            // No v3 kernel matched -- hard error. No fallback to v2/FA2.
+            Err(LLMError::GpuError(format!(
+                "No attention kernel available for num_heads={num_heads} num_kv_heads={num_kv_heads} \
+                 head_dim={head_dim}. Ensure flash_attention_3_v3.ptx is compiled."
+            )))
         }
 
         /// Fused residual add + RMSNorm, all f16.

@@ -615,6 +615,9 @@ impl GpuWorker {
             // Uses nvcc + CUTLASS headers. Cached to ~/.cache/rvllm/fusion/.
             Self::jit_compile_fused_kernels(&mut loader, &self.config)?;
 
+            // Hard validation: all required kernels must be loaded. No silent fallbacks.
+            loader.validate_required_kernels();
+
             let mr_config = self.config.model_runner_config();
             let mut runner = rvllm_model_runner::gpu_runner::GpuModelRunner::new(
                 loader_weights,

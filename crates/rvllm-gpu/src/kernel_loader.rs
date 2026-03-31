@@ -439,6 +439,62 @@ impl KernelLoader {
         })
     }
 
+    /// Like get_func but panics if the kernel is missing.
+    /// Use this for kernels that MUST be available -- no silent fallbacks.
+    pub fn require_func(&self, module: &str, function: &str) -> CudaFunction {
+        self.get_func(module, function).unwrap_or_else(|e| {
+            panic!("REQUIRED kernel missing: {module}::{function} -- {e}. \
+                    All required kernels must be compiled and loadable. \
+                    Run `bash kernels/build.sh` to compile kernel PTX files.")
+        })
+    }
+
+    /// Validate that all required kernels for decode inference are loaded.
+    /// Panics with a clear message listing every missing kernel.
+    pub fn validate_required_kernels(&self) {
+        let required: &[(&str, &str)] = &[
+            // Attention
+            ("flash_attention_3_v3", "fa3_v3_decode_gqa_kernel"),
+            ("flash_attention_3_v3", "fa3_v3_decode_kernel"),
+            ("flash_attention_3_v3", "fa3_v3_combine_f16_kernel"),
+            // Fused GEMV (T=1 decode)
+            ("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_gemv"),
+            ("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv"),
+            ("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv"),
+            ("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_bias_gemv"),
+            ("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv"),
+            ("fused_silu_down_gemv", "fused_cute_silu_down_gemv"),
+            ("fused_oproj_add_norm_gateup_gemv", "fused_cute_oproj_add_norm_gateup_gemv"),
+            // Fused ops
+            ("fused_rope_cache", "fused_rope_cache_f16_kernel"),
+            ("fused_residual_rmsnorm_f16", "fused_residual_rmsnorm_f16_kernel"),
+            // Core
+            ("rms_norm_f16", "rms_norm_f16_kernel"),
+            ("activation_f16", "fused_silu_mul_f16_kernel"),
+            ("embedding_gather_f16", "embedding_gather_f16_kernel"),
+            ("reshape_and_cache_f16", "reshape_and_cache_f16io_kernel"),
+            ("rotary_embedding_f16", "rotary_embedding_f16_kernel"),
+            ("add_bias_f16", "add_bias_f16_kernel"),
+            ("add_bias_f16", "add_f16_kernel"),
+        ];
+
+        let mut missing = Vec::new();
+        for &(module, function) in required {
+            if !self.has_func(module, function) {
+                missing.push(format!("  {module}::{function}"));
+            }
+        }
+        if !missing.is_empty() {
+            panic!(
+                "FATAL: {} required kernel(s) missing:\n{}\n\
+                 Run `bash kernels/build.sh` to compile all kernel PTX files.",
+                missing.len(),
+                missing.join("\n")
+            );
+        }
+        info!("All {} required kernels validated", required.len());
+    }
+
     /// Check if a module has been loaded (PTX or cubin).
     pub fn has_module(&self, module: &str) -> bool {
         self.modules.contains_key(module) || self.cubin_modules.contains_key(module)
